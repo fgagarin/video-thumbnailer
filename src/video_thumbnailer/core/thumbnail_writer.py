@@ -194,6 +194,7 @@ class FormatDispatchThumbnailWriter:
                             "-i", str(tmp_video_path),
                             "-i", cover_path,
                             "-map", "0",
+                            "-map", "-0:d",   # drop data streams (e.g. tmcd timecode)
                             "-map", "1",
                             "-c", "copy",
                             "-disposition:v:1", "attached_pic",
