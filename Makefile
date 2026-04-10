@@ -1,14 +1,16 @@
-.PHONY: help dist-linux dist-macos dist-windows test lint typecheck coverage clean
+.PHONY: help sync dist-linux dist-macos dist-windows test lint typecheck coverage clean
 
-PYTHON ?= python3
-PYINSTALLER ?= pyinstaller
+UV ?= uv
 
 help:
 	@echo "video-thumbnailer build targets"
 	@echo ""
-	@echo "  dist-linux   Build a Linux single-file executable"
-	@echo "  dist-macos   Build a macOS .app bundle"
-	@echo "  dist-windows Build a Windows .exe"
+	@echo "  sync         Install / sync all dependencies via uv"
+	@echo "  dist-linux   Build a Linux single-file executable  (run on Linux)"
+	@echo "  dist-macos   Build a macOS .app bundle             (run on macOS)"
+	@echo "  dist-windows Build a Windows .exe                  (run on Windows)"
+	@echo "  NOTE: PyInstaller cannot cross-compile. Each dist target must be"
+	@echo "        run on its native OS. Use GitHub Actions for CI builds."
 	@echo ""
 	@echo "  test         Run unit and integration tests"
 	@echo "  lint         Run ruff linter"
@@ -16,22 +18,27 @@ help:
 	@echo "  coverage     Run tests with >=80% coverage gate"
 	@echo "  clean        Remove build artefacts"
 
+# ── Environment ───────────────────────────────────────────────────────────────
+
+sync:
+	$(UV) sync --extra dev
+
 # ── Distribution ─────────────────────────────────────────────────────────────
 
 dist-linux:
-	$(PYINSTALLER) pyinstaller.spec \
+	$(UV) run pyinstaller pyinstaller.spec \
 		--distpath dist/linux \
 		--workpath build/linux \
 		--noconfirm
 
 dist-macos:
-	$(PYINSTALLER) pyinstaller.spec \
+	$(UV) run pyinstaller pyinstaller.spec \
 		--distpath dist/macos \
 		--workpath build/macos \
 		--noconfirm
 
 dist-windows:
-	$(PYINSTALLER) pyinstaller.spec \
+	$(UV) run pyinstaller pyinstaller.spec \
 		--distpath dist/windows \
 		--workpath build/windows \
 		--noconfirm
@@ -39,16 +46,16 @@ dist-windows:
 # ── Quality gates ─────────────────────────────────────────────────────────────
 
 test:
-	cd src && pytest ../tests/ -q
+	$(UV) run pytest tests/unit/ tests/integration/ -q
 
 lint:
-	ruff check src/ tests/
+	$(UV) run ruff check src/ tests/
 
 typecheck:
-	mypy --strict src/
+	$(UV) run mypy --strict src/
 
 coverage:
-	pytest --cov=video_thumbnailer \
+	$(UV) run pytest --cov=video_thumbnailer \
 		--cov-report=term-missing \
 		--cov-fail-under=80 \
 		tests/unit/ tests/integration/

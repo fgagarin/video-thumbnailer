@@ -61,3 +61,39 @@ jobs:
           python-version: "3.13"
       - run: pip install -e ".[dev]"
       - run: pytest tests/benchmarks/ --benchmark-only --benchmark-max-time=1
+
+  dist:
+    name: Build distribution
+    needs: [lint, typecheck, test]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: video-thumbnailer
+            asset_name: video-thumbnailer-linux
+          - os: macos-latest
+            artifact: video-thumbnailer
+            asset_name: video-thumbnailer-macos
+          - os: windows-latest
+            artifact: video-thumbnailer.exe
+            asset_name: video-thumbnailer-windows.exe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+      - name: Build executable
+        run: >
+          pyinstaller pyinstaller.spec
+          --distpath dist
+          --workpath build
+          --noconfirm
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: dist/${{ matrix.artifact }}
+          if-no-files-found: error
