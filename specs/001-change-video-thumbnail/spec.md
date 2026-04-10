@@ -4,6 +4,16 @@
 **Created**: 2026-04-10
 **Status**: Draft
 
+## Clarifications
+
+### Session 2026-04-10
+
+- Q: After the user presses Apply, can they undo or revert to the previous thumbnail? → A: No undo — the confirmation dialog is the only safeguard; once applied the change is permanent.
+- Q: Should the apply operation use atomic write semantics to prevent file corruption on crash? → A: Yes — write to a temp file in the same directory, then rename to replace the original atomically.
+- Q: What visual feedback does the user see during long operations (video loading, frame extraction, apply)? → A: Show a spinner/progress indicator and disable interactive controls during each operation.
+- Q: If the user drops a second video while one is already loaded, what happens? → A: Load the new video silently, replacing the current one (no confirmation needed — no destructive change has been committed yet).
+- Q: What is the maximum supported video resolution? → A: Up to 4K (3840×2160); 8K and above deferred to a future release.
+
 ## User Scenarios & Testing *(mandatory)*
 
 ### User Story 1 - Apply Custom Frame as Video Thumbnail (Priority: P1)
@@ -32,7 +42,8 @@ other story being implemented.
    within 500 ms.
 3. **Given** a frame is selected, **When** the user presses "Apply Thumbnail", **Then** a
    confirmation dialog appears if the video already contains an embedded thumbnail, asking
-   whether to overwrite.
+   whether to overwrite. There is no undo once applied — the confirmation dialog is the sole
+   safeguard.
 4. **Given** the user confirms (or no existing thumbnail), **When** the apply operation
    completes, **Then** a success message is shown and the file manager displays the new
    thumbnail within 5 seconds without the user restarting the file manager.
@@ -109,8 +120,12 @@ updated thumbnail. Verified independently from stories P1 and P2.
 - How does the system handle very short videos (< 1 second)?
   Expected: scrubber still works; any single frame can be selected and applied.
 - What happens when the user drops multiple files at once?
-  Expected: only the first file is loaded, or a user-friendly message explains one-at-a-time
+  Expected: only the first file is loaded; a user-friendly message explains that one-at-a-time
   operation is required in v1.
+- What happens when the user drops a new video while one is already loaded?
+  Expected: the new video loads silently, replacing the current one. No confirmation is needed
+  because no destructive change has been committed (the apply operation is the only
+  irreversible action).
 - What if the video file is on a read-only file system or network share?
   Expected: error dialog with actionable advice (copy file locally first).
 
@@ -119,7 +134,10 @@ updated thumbnail. Verified independently from stories P1 and P2.
 ### Functional Requirements
 
 - **FR-001**: System MUST accept supported video files via drag-and-drop onto the application
-  window.
+  window. Dropping a new video while one is already loaded MUST silently replace the current
+  video without a confirmation dialog.
+- **FR-001a**: System MUST support video files up to 4K resolution (3840×2160); videos at
+  higher resolutions are not required to be supported in v1.
 - **FR-002**: System MUST display an interactive timeline scrubber showing the total video
   duration after a video is loaded.
 - **FR-003**: Users MUST be able to position the timeline scrubber at any point in the video
@@ -137,8 +155,15 @@ updated thumbnail. Verified independently from stories P1 and P2.
   WebM, FLV.
 - **FR-009**: System MUST display a clear success or error message after each apply
   operation, including the reason for failure when an error occurs.
+- **FR-009a**: System MUST display a spinner and disable interactive controls during all
+  long-running operations: initial video loading, timeline scrub frame extraction (when
+  extraction exceeds 200 ms), and the apply operation. Controls MUST re-enable as soon as
+  the operation completes or fails.
 - **FR-010**: System MUST leave the original video file completely unmodified if any part of
-  the apply operation fails.
+  the apply operation fails. The apply operation MUST use an atomic write strategy: write the
+  updated file to a temporary file in the same directory, then rename it to replace the
+  original. If the process is interrupted at any point before the rename completes, the
+  original file MUST remain intact.
 - **FR-011**: System MUST trigger a file-manager thumbnail cache refresh on the local
   machine after a successful apply, using the platform's standard invalidation mechanism.
 - **FR-012**: System MUST operate without requiring administrator or root privileges on any
@@ -167,7 +192,8 @@ updated thumbnail. Verified independently from stories P1 and P2.
 - **SC-003**: Frame extraction and preview update happens within 500 ms of the user stopping
   the timeline scrubber.
 - **SC-004**: The application correctly completes the thumbnail-change workflow for all 6
-  supported formats without errors on standard test files for each format.
+  supported formats without errors on standard test files for each format, including at least
+  one 4K (3840×2160) test file.
 - **SC-005**: When an error occurs (read-only file, unsupported format, locked file), 100% of
   error messages include the specific cause and a suggested corrective action.
 - **SC-006**: The applied thumbnail is visible in Windows Explorer, macOS Finder, and Linux
@@ -190,6 +216,14 @@ updated thumbnail. Verified independently from stories P1 and P2.
 - Video files up to 2 GB are in scope; files larger than 2 GB are deferred to a future
   release.
 - The application does not create backup copies of the original file; users are responsible
-  for maintaining their own backups before using the tool.
+  for maintaining their own backups before using the tool. There is no in-session or
+  persistent undo/revert capability; the confirmation dialog before overwriting an existing
+  thumbnail is the only safeguard.
+- The apply operation uses an atomic write (write temp → rename) to prevent file corruption
+  on process crash or power loss during write.
+- Dropping a new video while one is already loaded silently replaces the current video.
+- The application displays a spinner and disables controls during video loading, frame
+  extraction, and the apply operation.
+- Maximum supported video resolution is 4K (3840×2160); 8K and above are deferred.
 - One video can be loaded at a time in v1; batch processing of multiple files is out of
   scope.
