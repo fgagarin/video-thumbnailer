@@ -1,6 +1,6 @@
 # video-thumbnailer
 
-A cross-platform desktop application for changing the thumbnail icon of a video file as displayed by the OS file manager.
+Many video players and file managers generate a thumbnail by grabbing the first frame of the video — which is often a black screen, a title card, or a fade-in. This tool lets you scrub to any frame you like and embed it as the video's cover art, so the thumbnail actually shows something meaningful.
 
 Built with Python 3.13, PySide6 (Qt6), and PyAV.
 
