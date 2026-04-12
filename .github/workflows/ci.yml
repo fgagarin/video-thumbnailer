@@ -56,10 +56,14 @@ jobs:
             libxcb-shape0 libxcb-xinerama0 libxcb-xkb1 \
             libxkbcommon-x11-0
       - run: pip install -e ".[dev]"
-      - name: Run tests
+      - name: Run tests with coverage gate (Linux)
+        if: runner.os == 'Linux'
         run: pytest --cov=video_thumbnailer --cov-report=term-missing --cov-fail-under=80
         env:
           QT_QPA_PLATFORM: offscreen
+      - name: Run tests (macOS/Windows)
+        if: runner.os != 'Linux'
+        run: pytest
 
   benchmark:
     name: Benchmark
