@@ -8,6 +8,34 @@ Built with Python 3.13, PySide6 (Qt6), and PyAV.
 
 ---
 
+## What it looks like
+
+### Before (original thumbnail)
+
+![Before thumbnail](before.png)
+
+### Application
+
+![Application screen](application.png)
+
+### After (updated thumbnail)
+
+![Updated thumbnail](after.png)
+
+---
+
+## Quick start
+
+```bash
+python3.13 -m venv .venv
+source .venv/bin/activate        # Linux / macOS
+# .venv\Scripts\activate         # Windows
+pip install -e ".[dev]"
+video-thumbnailer
+```
+
+---
+
 ## Requirements
 
 - Python 3.13+
@@ -46,6 +74,12 @@ Or directly via the module:
 ```bash
 python -m video_thumbnailer.app
 ```
+
+Typical workflow:
+
+1. Open a video file.
+2. Scrub the timeline to the frame you want.
+3. Apply/save the thumbnail.
 
 ---
 
