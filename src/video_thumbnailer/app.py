@@ -2,7 +2,23 @@
 
 from __future__ import annotations
 
+import ctypes
 import sys
+from pathlib import Path
+
+from PySide6.QtGui import QIcon
+
+
+def _resource_path(name: str) -> Path:
+    bundle_dir = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[2]))
+    return bundle_dir / name
+
+
+def _set_windows_app_user_model_id() -> None:
+    if sys.platform == "win32":
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            ctypes.c_wchar_p("VideoThumbnailer.Application")
+        )
 
 
 def main() -> None:
@@ -15,7 +31,10 @@ def main() -> None:
     from video_thumbnailer.platform import get_cache_invalidator
     from video_thumbnailer.ui.main_window import MainWindow
 
+    _set_windows_app_user_model_id()
     app = QApplication(sys.argv)
+    icon = QIcon(str(_resource_path("icon.png")))
+    app.setWindowIcon(icon)
 
     loader = PyAVVideoLoader()
     extractor = PyAVFrameExtractor()
@@ -23,6 +42,7 @@ def main() -> None:
     invalidator = get_cache_invalidator()
 
     window = MainWindow(loader, extractor, writer, invalidator)
+    window.setWindowIcon(icon)
     window.show()
 
     sys.exit(app.exec())

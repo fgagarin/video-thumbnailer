@@ -9,11 +9,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from PIL import Image
-from PySide6.QtCore import QSettings, Qt, QThreadPool, QUrl, Signal
+from PySide6.QtCore import QRect, QSettings, Qt, QThreadPool, QTimer, QUrl, Signal
 from PySide6.QtGui import (
+    QColor,
     QDesktopServices,
     QDropEvent,
+    QIcon,
     QKeySequence,
+    QPainter,
+    QPen,
     QPixmap,
     QShortcut,
 )
@@ -23,8 +27,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMessageBox,
-    QProgressDialog,
-    QPushButton,
     QStyle,
     QToolButton,
     QVBoxLayout,
@@ -91,7 +93,10 @@ class MainWindow(QMainWindow):
         self._frame_extract_target_ms: int | None = None
         self._pool = QThreadPool.globalInstance()
         self._active_workers: int = 0
-        self._progress_dialog: QProgressDialog | None = None
+        self._spinner_angle = 0
+        self._save_spinner = QTimer(self)
+        self._save_spinner.setInterval(80)
+        self._save_spinner.timeout.connect(self._advance_save_spinner)
         self._settings = QSettings("Video Thumbnailer", "Video Thumbnailer")
         last_open_directory = self._settings.value(
             "lastOpenDirectory", str(Path.home()), type=str
@@ -175,6 +180,10 @@ class MainWindow(QMainWindow):
         # Side-by-side preview (hidden until a video is loaded)
         self._preview = PreviewWidget()
         self._preview.hide()
+        self._apply_btn = self._preview.apply_button
+        self._apply_btn.setEnabled(False)
+        self._apply_btn.clicked.connect(self._on_apply_clicked)
+        self._save_icon = self._apply_btn.icon()
         layout.addWidget(self._preview)
 
         self._filmstrip = FilmstripWidget()
@@ -188,13 +197,6 @@ class MainWindow(QMainWindow):
         self._timeline.hide()
         self._timeline.positionChanged.connect(self._on_scrub)
         layout.addWidget(self._timeline)
-
-        # Apply button
-        self._apply_btn = QPushButton("Apply Thumbnail")
-        self._apply_btn.setEnabled(False)
-        self._apply_btn.hide()
-        self._apply_btn.clicked.connect(self._on_apply_clicked)
-        layout.addWidget(self._apply_btn)
 
     # ------------------------------------------------------------------
     # Drag-and-drop
@@ -383,11 +385,8 @@ class MainWindow(QMainWindow):
             if answer != QMessageBox.StandardButton.Yes:
                 return
 
+        self._start_save_state()
         self._set_busy(True)
-        dlg = QProgressDialog("Applying thumbnail\u2026", "", 0, 0, self)
-        dlg.setWindowModality(Qt.WindowModality.WindowModal)
-        dlg.show()
-        self._progress_dialog = dlg
 
         worker = ApplyWorker(
             self._writer,
@@ -401,8 +400,8 @@ class MainWindow(QMainWindow):
         self._pool.start(worker)
 
     def _on_apply_done(self, result: ApplyResult) -> None:
-        self._close_progress()
         self._set_busy(False)
+        self._finish_save_state()
 
         if result.success:
             # Update the cached existing_thumbnail so subsequent confirmation dialogs
@@ -428,7 +427,6 @@ class MainWindow(QMainWindow):
                     thumbnail_position_ms=self._current_frame_position_ms,
                 )
                 self._preview.set_current_thumbnail(self._current_frame)
-            QMessageBox.information(self, "Success", "Thumbnail applied successfully.")
         else:
             QMessageBox.critical(
                 self,
@@ -437,8 +435,8 @@ class MainWindow(QMainWindow):
             )
 
     def _on_apply_error(self, message: str) -> None:
-        self._close_progress()
         self._set_busy(False)
+        self._finish_save_state()
         QMessageBox.critical(self, "Apply Error", message)
 
     # ------------------------------------------------------------------
@@ -449,6 +447,38 @@ class MainWindow(QMainWindow):
         self._timeline.setEnabled(not busy and self._video is not None)
         self._apply_btn.setEnabled(not busy and self._current_frame is not None)
         self._drop_label.setAcceptDrops(not busy)
+
+    def _start_save_state(self) -> None:
+        self._apply_btn.setText("Saving…")
+        self._apply_btn.setIcon(self._spinner_icon(self._spinner_angle))
+        self._apply_btn.setEnabled(False)
+        self._save_spinner.start()
+
+    def _advance_save_spinner(self) -> None:
+        self._spinner_angle = (self._spinner_angle + 30) % 360
+        self._apply_btn.setIcon(self._spinner_icon(self._spinner_angle))
+
+    def _finish_save_state(self) -> None:
+        self._save_spinner.stop()
+        self._apply_btn.setText("Save thumbnail")
+        if self._save_icon is not None:
+            self._apply_btn.setIcon(self._save_icon)
+        self._apply_btn.setEnabled(
+            self._video is not None and self._current_frame is not None
+        )
+
+    @staticmethod
+    def _spinner_icon(angle: int) -> QIcon:
+        pixmap = QPixmap(24, 24)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(QColor("#ffffff"), 2.5)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        painter.drawArc(QRect(4, 4, 16, 16), angle * 16, 275 * 16)
+        painter.end()
+        return QIcon(pixmap)
 
     def _show_video_in_folder(self) -> None:
         if self._video is None:
@@ -492,12 +522,6 @@ class MainWindow(QMainWindow):
         lower = video.duration_ms // 3
         upper = video.duration_ms * 2 // 3
         return random.randint(lower, max(lower, upper))
-
-    def _close_progress(self) -> None:
-        if self._progress_dialog is not None:
-            self._progress_dialog.close()
-            self._progress_dialog = None
-
 
 def _pil_to_pixmap(image: Image.Image) -> QPixmap:
     """Convert a PIL Image to a QPixmap."""

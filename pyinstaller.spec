@@ -17,6 +17,13 @@ from PyInstaller.utils.hooks import collect_data_files
 datas = []
 datas += collect_data_files("av")
 datas += collect_data_files("PySide6")
+datas += [("icon.png", ".")]
+
+app_icon = None
+if sys.platform == "win32":
+    app_icon = "icon.ico"
+elif sys.platform == "darwin":
+    app_icon = "icon.icns"
 
 block_cipher = None
 
@@ -73,4 +80,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=app_icon,
 )

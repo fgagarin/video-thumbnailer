@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from PIL import Image
-from PySide6.QtCore import QSettings, Qt
+from PySide6.QtCore import QPoint, QSettings, Qt
 from PySide6.QtGui import QKeySequence
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QFileDialog, QMessageBox
@@ -200,8 +200,22 @@ class TestMainWindowVideoLoading:
         assert layout.indexOf(window._preview) < layout.indexOf(window._timeline)
         assert layout.indexOf(window._preview) < layout.indexOf(window._filmstrip)
         assert layout.indexOf(window._filmstrip) < layout.indexOf(window._timeline)
-        assert layout.indexOf(window._timeline) < layout.indexOf(window._apply_btn)
         assert window._filmstrip.width() == window._timeline.width()
+        left_panel = window._preview._candidate_title.parentWidget()
+        right_panel = window._preview._current_title.parentWidget()
+        assert left_panel.geometry().x() < right_panel.geometry().x()
+        thumbnail_layout = window._preview._thumbnail_column.layout()
+        assert thumbnail_layout.indexOf(right_panel) < thumbnail_layout.indexOf(
+            window._apply_btn
+        )
+        assert right_panel.geometry().bottom() < window._apply_btn.geometry().top()
+        assert right_panel.geometry().x() == window._apply_btn.geometry().x()
+        assert abs(
+            left_panel.mapTo(window._preview, QPoint(0, left_panel.height())).y()
+            - window._apply_btn.mapTo(
+                window._preview, QPoint(0, window._apply_btn.height())
+            ).y()
+        ) <= 1
 
     def test_filmstrip_selection_moves_timeline_and_extracts_frame(
         self, window: MainWindow
@@ -319,20 +333,62 @@ class TestMainWindowFrameExtraction:
 
 
 class TestMainWindowApplyThumbnail:
-    def test_on_apply_done_success_shows_info(self, window: MainWindow) -> None:
+    def test_on_apply_done_success_is_silent_and_updates_thumbnail(
+        self, window: MainWindow
+    ) -> None:
         vf = _make_vf()
         window._on_video_loaded(vf)
+        frame = Image.new("RGB", (32, 32))
+        window._current_frame = frame
+        window._start_save_state()
+
+        with (
+            patch.object(QMessageBox, "information") as mock_info,
+            patch.object(QMessageBox, "critical") as mock_error,
+        ):
+            window._on_apply_done(ApplyResult(success=True))
+
+        mock_info.assert_not_called()
+        mock_error.assert_not_called()
+        assert window._apply_btn.text() == "Save thumbnail"
+        assert window._apply_btn.isEnabled()
+        assert not window._save_spinner.isActive()
+        assert window._video is not None
+        assert window._video.existing_thumbnail is frame
+        assert not window._preview._current_label.pixmap().isNull()
+
+    def test_apply_click_shows_spinner_and_disables_button(
+        self, window: MainWindow
+    ) -> None:
+        window._on_video_loaded(_make_vf())
         window._current_frame = Image.new("RGB", (32, 32))
 
-        result = ApplyResult(success=True)
-        with patch.object(QMessageBox, "information", return_value=None) as mock_info:
-            window._on_apply_done(result)
-        mock_info.assert_called_once()
+        with patch.object(window._pool, "start"):
+            window._on_apply_clicked()
+
+        assert window._apply_btn.text() == "Saving…"
+        assert not window._apply_btn.isEnabled()
+        assert window._save_spinner.isActive()
+        window._finish_save_state()
+
+    def test_apply_error_restores_button_and_shows_error(self, window: MainWindow) -> None:
+        window._on_video_loaded(_make_vf())
+        window._current_frame = Image.new("RGB", (32, 32))
+        window._start_save_state()
+
+        with patch.object(QMessageBox, "critical", return_value=None) as mock_error:
+            window._on_apply_error("disk write failed")
+
+        mock_error.assert_called_once()
+        assert window._apply_btn.text() == "Save thumbnail"
+        assert window._apply_btn.isEnabled()
+        assert not window._save_spinner.isActive()
 
     def test_on_apply_done_failure_shows_error(self, window: MainWindow) -> None:
         vf = _make_vf()
         window._on_video_loaded(vf)
         window._current_frame = Image.new("RGB", (32, 32))
+        window._start_save_state()
 
         result = ApplyResult(
             success=False,
@@ -342,6 +398,8 @@ class TestMainWindowApplyThumbnail:
         with patch.object(QMessageBox, "critical", return_value=None) as mock_err:
             window._on_apply_done(result)
         mock_err.assert_called_once()
+        assert window._apply_btn.text() == "Save thumbnail"
+        assert window._apply_btn.isEnabled()
 
     def test_on_apply_error_shows_critical(self, window: MainWindow) -> None:
         with patch.object(QMessageBox, "critical", return_value=None) as mock_crit:
@@ -369,10 +427,6 @@ class TestMainWindowApplyThumbnail:
         with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.No):
             window._on_apply_clicked()
         # Apply should have been cancelled — no worker running
-
-    def test_close_progress_when_none_is_noop(self, window: MainWindow) -> None:
-        window._progress_dialog = None
-        window._close_progress()  # should not raise
 
     def test_set_busy_disables_controls(self, window: MainWindow) -> None:
         vf = _make_vf()
