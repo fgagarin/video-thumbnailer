@@ -50,6 +50,11 @@ class TestTimelineWidget:
         widget.set_position(5_000)
         assert widget._position_ms == 5_000
 
+    def test_current_position_ms_returns_current_position(self, widget: TimelineWidget) -> None:
+        widget.set_duration(10_000)
+        widget.set_position(1234)
+        assert widget.current_position_ms() == 1234
+
     def test_size_hint(self, widget: TimelineWidget) -> None:
         hint = widget.sizeHint()
         assert hint.width() == 300

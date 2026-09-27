@@ -69,6 +69,10 @@ class TestMainWindowConstruction:
     def test_drop_zone_visible(self, window: MainWindow) -> None:
         assert window._drop_label.isVisible()
 
+    def test_hotkeys_help_visible(self, window: MainWindow) -> None:
+        assert "Left Arrow" in window._hotkeys_label.text()
+        assert "Right Arrow" in window._hotkeys_label.text()
+
 
 class TestMainWindowVideoLoading:
     def test_on_video_loaded_updates_ui(self, window: MainWindow) -> None:
@@ -120,6 +124,30 @@ class TestMainWindowFrameExtraction:
         with patch.object(QMessageBox, "warning", return_value=None) as mock_warn:
             window._on_extract_error("decode fail")
         mock_warn.assert_called_once()
+
+    def test_step_selected_frame_moves_timeline(self, window: MainWindow) -> None:
+        vf = _make_vf()
+        vf.frame_step_ms = 40
+        window._on_video_loaded(vf)
+        window._timeline.set_position(1000)
+
+        with patch.object(window, "_on_scrub") as mock_scrub:
+            window._step_selected_frame(1)
+
+        assert window._timeline.current_position_ms() == 1040
+        mock_scrub.assert_called_once_with(1040)
+
+    def test_step_selected_frame_clamps_at_zero(self, window: MainWindow) -> None:
+        vf = _make_vf()
+        vf.frame_step_ms = 40
+        window._on_video_loaded(vf)
+        window._timeline.set_position(0)
+
+        with patch.object(window, "_on_scrub") as mock_scrub:
+            window._step_selected_frame(-1)
+
+        assert window._timeline.current_position_ms() == 0
+        mock_scrub.assert_not_called()
 
 
 class TestMainWindowApplyThumbnail:

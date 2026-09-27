@@ -38,6 +38,8 @@ _ALL_SUPPORTED = (
     _MP4_MOV_FORMATS | _MKV_FORMATS | _WEBM_FORMATS | _AVI_FORMATS | _FLV_FORMATS
 )
 
+_MP4_COVER_FORMAT_JPEG = 13
+
 
 class FormatDispatchThumbnailWriter:
     """Embed a thumbnail into a video file using the format-appropriate mechanism.
@@ -110,7 +112,11 @@ class FormatDispatchThumbnailWriter:
 
         try:
             if video.format in _MP4_MOV_FORMATS:
-                self._embed_mp4_mov(video.path, jpeg_bytes)
+                self._embed_mp4_mov(
+                    video.path,
+                    jpeg_bytes,
+                    write_mp4_covr=video.format is VideoFormat.MP4,
+                )
             elif video.format in _MKV_FORMATS:
                 self._embed_mkv_webm(video.path, jpeg_bytes)
             elif video.format in _AVI_FORMATS:
@@ -168,7 +174,13 @@ class FormatDispatchThumbnailWriter:
     # Format-specific embedding helpers
     # ------------------------------------------------------------------
 
-    def _embed_mp4_mov(self, video_path: str, jpeg_bytes: bytes) -> None:
+    def _embed_mp4_mov(
+        self,
+        video_path: str,
+        jpeg_bytes: bytes,
+        *,
+        write_mp4_covr: bool,
+    ) -> None:
         """Embed cover art into an MP4 or MOV file using ffmpeg subprocess."""
         ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
         # Write the JPEG bytes to a temp file so ffmpeg can read them
@@ -205,6 +217,8 @@ class FormatDispatchThumbnailWriter:
                         capture_output=True,
                     )
                     os.replace(out_path, tmp_video_path)
+                    if write_mp4_covr:
+                        self._write_mp4_covr_tag(tmp_video_path, jpeg_bytes)
                 except Exception:
                     try:
                         os.unlink(out_path)
@@ -218,6 +232,15 @@ class FormatDispatchThumbnailWriter:
                 os.unlink(cover_path)
             except FileNotFoundError:
                 pass
+
+    def _write_mp4_covr_tag(self, video_path: Path, jpeg_bytes: bytes) -> None:
+        """Write JPEG cover art into the MP4 ``covr`` tag for Telegram clients."""
+        from mutagen.mp4 import MP4, MP4Cover
+
+        tags = MP4(str(video_path))
+        tags.tags = tags.tags or {}
+        tags.tags["covr"] = [MP4Cover(jpeg_bytes, imageformat=_MP4_COVER_FORMAT_JPEG)]
+        tags.save()
 
     def _embed_mkv_webm(self, video_path: str, jpeg_bytes: bytes) -> None:
         """Embed cover art into an MKV or WebM file using ffmpeg -attach."""

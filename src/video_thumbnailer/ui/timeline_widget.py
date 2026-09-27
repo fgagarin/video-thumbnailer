@@ -65,6 +65,10 @@ class TimelineWidget(QWidget):
         self._position_ms = max(0, min(ms, self._duration_ms))
         self.update()
 
+    def current_position_ms(self) -> int:
+        """Return the scrubber's current position in milliseconds."""
+        return self._position_ms
+
     def sizeHint(self) -> QSize:
         return QSize(300, 40)
 

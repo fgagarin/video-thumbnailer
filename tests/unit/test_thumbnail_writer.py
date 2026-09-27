@@ -7,6 +7,7 @@ from pathlib import Path
 import av
 import pytest
 from PIL import Image
+from mutagen.mp4 import MP4
 
 from video_thumbnailer.core.thumbnail_writer import FormatDispatchThumbnailWriter
 from video_thumbnailer.core.video_loader import PyAVVideoLoader
@@ -63,6 +64,23 @@ class TestThumbnailWriter:
         result = writer.write(vf, sample_pil_image)
         assert result.success is True
         assert result.elapsed_ms >= 0
+
+    def test_write_mp4_adds_covr_tag(
+        self,
+        loader: PyAVVideoLoader,
+        writer: FormatDispatchThumbnailWriter,
+        sample_video: Path,
+        sample_pil_image: Image.Image,
+    ) -> None:
+        vf = loader.load(str(sample_video))
+        result = writer.write(vf, sample_pil_image)
+
+        assert result.success is True
+
+        tags = MP4(str(sample_video)).tags
+        assert tags is not None
+        assert "covr" in tags
+        assert len(tags["covr"]) == 1
 
     def test_write_read_only_returns_error(
         self,

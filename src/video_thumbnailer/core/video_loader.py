@@ -105,6 +105,27 @@ def _extract_existing_thumbnail(
     return None
 
 
+def _detect_frame_step_ms(stream: av.video.stream.VideoStream) -> int:
+    """Return an approximate frame duration in milliseconds for ``stream``."""
+    try:
+        if stream.average_rate is not None:
+            fps = float(stream.average_rate)
+            if fps > 0:
+                return max(1, int(round(1000 / fps)))
+    except (TypeError, ValueError, ZeroDivisionError):
+        pass
+
+    try:
+        if stream.base_rate is not None:
+            fps = float(stream.base_rate)
+            if fps > 0:
+                return max(1, int(round(1000 / fps)))
+    except (AttributeError, TypeError, ValueError, ZeroDivisionError):
+        pass
+
+    return 40
+
+
 class PyAVVideoLoader:
     """Load a video file and return a VideoFile domain entity.
 
@@ -156,6 +177,7 @@ class PyAVVideoLoader:
 
             width = stream.width or 0
             height = stream.height or 0
+            frame_step_ms = _detect_frame_step_ms(stream)
 
             existing_thumbnail = _extract_existing_thumbnail(container)
         finally:
@@ -171,4 +193,5 @@ class PyAVVideoLoader:
             height=height,
             existing_thumbnail=existing_thumbnail,
             is_writable=is_writable,
+            frame_step_ms=frame_step_ms,
         )

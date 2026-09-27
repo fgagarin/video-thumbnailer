@@ -48,6 +48,7 @@ class VideoFile:
         height: Video stream pixel height (>0).
         existing_thumbnail: Current embedded cover-art image, or None if absent.
         is_writable: Whether the file is writable by the current user.
+        frame_step_ms: Approximate duration of one video frame in milliseconds.
     """
 
     path: str
@@ -57,6 +58,7 @@ class VideoFile:
     height: int
     existing_thumbnail: PILImage.Image | None
     is_writable: bool
+    frame_step_ms: int = 40
 
 
 @dataclass

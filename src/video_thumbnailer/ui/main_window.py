@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 from PIL import Image
 from PySide6.QtCore import Qt, QThreadPool
-from PySide6.QtGui import QDropEvent, QPixmap
+from PySide6.QtGui import QDropEvent, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
@@ -63,8 +63,10 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Video Thumbnailer")
         self.setMinimumSize(500, 500)
         self.setAcceptDrops(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
         self._build_ui()
+        self._install_shortcuts()
 
     # ------------------------------------------------------------------
     # UI construction
@@ -97,6 +99,13 @@ class MainWindow(QMainWindow):
         self._timeline.positionChanged.connect(self._on_scrub)
         layout.addWidget(self._timeline)
 
+        self._hotkeys_label = QLabel(
+            "Hotkeys: Left Arrow - previous frame, Right Arrow - next frame"
+        )
+        self._hotkeys_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._hotkeys_label.setStyleSheet("color: #666666; font-size: 12px;")
+        layout.addWidget(self._hotkeys_label)
+
         # Side-by-side preview (hidden until a video is loaded)
         self._preview = PreviewWidget()
         self._preview.hide()
@@ -128,6 +137,13 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Video loading
     # ------------------------------------------------------------------
+
+    def _install_shortcuts(self) -> None:
+        prev_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Left), self)
+        prev_shortcut.activated.connect(lambda: self._step_selected_frame(-1))
+        next_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Right), self)
+        next_shortcut.activated.connect(lambda: self._step_selected_frame(1))
+        self._frame_shortcuts = [prev_shortcut, next_shortcut]
 
     def _load_video(self, path: str) -> None:
         self._set_busy(True)
@@ -170,6 +186,19 @@ class MainWindow(QMainWindow):
         worker.signals.finished.connect(self._on_frame_extracted)
         worker.signals.error.connect(self._on_extract_error)
         self._pool.start(worker)
+
+    def _step_selected_frame(self, direction: int) -> None:
+        if self._video is None or not self._timeline.isEnabled():
+            return
+
+        current_ms = self._timeline.current_position_ms()
+        step_ms = max(1, self._video.frame_step_ms)
+        next_ms = max(0, min(self._video.duration_ms, current_ms + direction * step_ms))
+        if next_ms == current_ms:
+            return
+
+        self._timeline.set_position(next_ms)
+        self._on_scrub(next_ms)
 
     def _on_frame_extracted(self, image: Image.Image) -> None:
         self._current_frame = image
@@ -229,6 +258,7 @@ class MainWindow(QMainWindow):
                     height=self._video.height,
                     existing_thumbnail=self._current_frame,
                     is_writable=self._video.is_writable,
+                    frame_step_ms=self._video.frame_step_ms,
                 )
                 self._preview.set_current_thumbnail(self._current_frame)
             QMessageBox.information(self, "Success", "Thumbnail applied successfully.")
