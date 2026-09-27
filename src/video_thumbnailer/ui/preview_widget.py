@@ -46,8 +46,12 @@ class PreviewWidget(QWidget):
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(8)
 
-        self._current_label = self._make_panel(layout, "Current Thumbnail")
-        self._candidate_label = self._make_panel(layout, "Selected Frame")
+        self._current_title, self._current_label = self._make_panel(
+            layout, "Current Thumbnail"
+        )
+        self._candidate_title, self._candidate_label = self._make_panel(
+            layout, "Selected Frame"
+        )
 
         self._show_placeholder(self._current_label, "No current thumbnail")
         self._show_placeholder(self._candidate_label, "No frame selected")
@@ -63,14 +67,23 @@ class PreviewWidget(QWidget):
         else:
             self._show_pixmap(self._current_label, image)
 
-    def set_candidate_frame(self, image: PILImage) -> None:
+    def set_candidate_frame(
+        self, image: PILImage, position_ms: int | None = None
+    ) -> None:
         """Display a selected video frame as the candidate thumbnail."""
+        if position_ms is None:
+            self._candidate_title.setText("Selected Frame")
+        else:
+            self._candidate_title.setText(
+                f"Selected Frame ({self._format_position(position_ms)})"
+            )
         self._show_pixmap(self._candidate_label, image)
 
     def clear(self) -> None:
         """Reset both panels to their placeholder states."""
         self._show_placeholder(self._current_label, "No current thumbnail")
         self._show_placeholder(self._candidate_label, "No frame selected")
+        self._candidate_title.setText("Selected Frame")
 
     def sizeHint(self) -> QSize:
         return QSize(540, 165)
@@ -79,7 +92,9 @@ class PreviewWidget(QWidget):
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _make_panel(self, parent_layout: QHBoxLayout, title: str) -> QLabel:
+    def _make_panel(
+        self, parent_layout: QHBoxLayout, title: str
+    ) -> tuple[QLabel, QLabel]:
         frame = QFrame()
         frame.setFrameShape(QFrame.Shape.StyledPanel)
         vbox = QVBoxLayout(frame)
@@ -96,7 +111,13 @@ class PreviewWidget(QWidget):
         vbox.addWidget(img_label)
 
         parent_layout.addWidget(frame)
-        return img_label
+        return title_label, img_label
+
+    @staticmethod
+    def _format_position(position_ms: int) -> str:
+        total_seconds, milliseconds = divmod(max(0, position_ms), 1000)
+        minutes, seconds = divmod(total_seconds, 60)
+        return f"{minutes}:{seconds:02d}.{milliseconds:03d}"
 
     def _show_placeholder(self, label: QLabel, text: str) -> None:
         label.setPixmap(QPixmap())

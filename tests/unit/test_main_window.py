@@ -102,6 +102,13 @@ class TestMainWindowVideoLoading:
         window._on_video_loaded(vf)
         assert "test.mp4" in window._drop_label.text() or "MP4" in window._drop_label.text()
 
+    def test_drop_label_wraps_and_keeps_long_path(self, window: MainWindow) -> None:
+        path = "C:\\videos\\" + "a_long_folder\\" * 12 + "movie.mp4"
+        window._on_video_loaded(_make_vf(path))
+
+        assert window._drop_label.wordWrap()
+        assert path in window._drop_label.text()
+
 
 class TestMainWindowFrameExtraction:
     def test_on_frame_extracted_enables_apply(self, window: MainWindow) -> None:
@@ -136,6 +143,37 @@ class TestMainWindowFrameExtraction:
 
         assert window._timeline.current_position_ms() == 1040
         mock_scrub.assert_called_once_with(1040)
+
+    def test_repeated_step_moves_timeline_while_busy(self, window: MainWindow) -> None:
+        vf = _make_vf()
+        vf.frame_step_ms = 40
+        window._on_video_loaded(vf)
+        window._timeline.set_position(1000)
+        window._set_busy(True)
+
+        with patch.object(window, "_on_scrub") as mock_scrub:
+            for _ in range(5):
+                window._step_selected_frame(1)
+
+        assert window._timeline.current_position_ms() == 1200
+        assert [call.args[0] for call in mock_scrub.call_args_list] == [
+            1040, 1080, 1120, 1160, 1200
+        ]
+
+    def test_frame_shortcuts_allow_auto_repeat(self, window: MainWindow) -> None:
+        assert all(shortcut.autoRepeat() for shortcut in window._frame_shortcuts)
+
+    def test_stale_frame_result_retries_latest_position(self, window: MainWindow) -> None:
+        window._on_video_loaded(_make_vf())
+        window._timeline.set_position(2000)
+        window._frame_extract_active = True
+        window._frame_extract_target_ms = 1000
+
+        with patch.object(window, "_on_scrub") as mock_scrub:
+            window._on_frame_extracted(Image.new("RGB", (32, 32)))
+
+        mock_scrub.assert_called_once_with(2000)
+        assert window._current_frame is None
 
     def test_step_selected_frame_clamps_at_zero(self, window: MainWindow) -> None:
         vf = _make_vf()

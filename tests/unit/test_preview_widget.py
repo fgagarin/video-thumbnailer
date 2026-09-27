@@ -52,6 +52,13 @@ class TestPreviewWidget:
         assert pixmap is not None
         assert not pixmap.isNull()
 
+    def test_candidate_frame_shows_selected_timestamp(
+        self, preview: PreviewWidget, pil_image: Image.Image
+    ) -> None:
+        preview.set_candidate_frame(pil_image, 61_234)
+
+        assert preview._candidate_title.text() == "Selected Frame (1:01.234)"
+
     def test_clear_resets_both_panels(
         self, preview: PreviewWidget, pil_image: Image.Image
     ) -> None:
@@ -60,6 +67,7 @@ class TestPreviewWidget:
         preview.clear()
         assert "No current thumbnail" in preview._current_label.text()
         assert "No frame selected" in preview._candidate_label.text()
+        assert preview._candidate_title.text() == "Selected Frame"
 
     def test_size_hint(self, preview: PreviewWidget) -> None:
         assert preview.sizeHint() == QSize(540, 165)

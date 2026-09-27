@@ -56,6 +56,8 @@ class MainWindow(QMainWindow):
 
         self._video: VideoFile | None = None
         self._current_frame: Image.Image | None = None
+        self._frame_extract_active = False
+        self._frame_extract_target_ms: int | None = None
         self._pool = QThreadPool.globalInstance()
         self._active_workers: int = 0
         self._progress_dialog: QProgressDialog | None = None
@@ -83,6 +85,11 @@ class MainWindow(QMainWindow):
         self._drop_label = QLabel("Drop a video file here")
         self._drop_label.setMinimumHeight(_DROP_ZONE_MIN_HEIGHT)
         self._drop_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._drop_label.setWordWrap(True)
+        self._drop_label.setTextFormat(Qt.TextFormat.PlainText)
+        self._drop_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
         self._drop_label.setStyleSheet(
             "QLabel {"
             "  border: 2px dashed #aaaaaa;"
@@ -140,8 +147,10 @@ class MainWindow(QMainWindow):
 
     def _install_shortcuts(self) -> None:
         prev_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Left), self)
+        prev_shortcut.setAutoRepeat(True)
         prev_shortcut.activated.connect(lambda: self._step_selected_frame(-1))
         next_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Right), self)
+        next_shortcut.setAutoRepeat(True)
         next_shortcut.activated.connect(lambda: self._step_selected_frame(1))
         self._frame_shortcuts = [prev_shortcut, next_shortcut]
 
@@ -163,6 +172,7 @@ class MainWindow(QMainWindow):
         )
         self._timeline.set_duration(video.duration_ms)
         self._timeline.setEnabled(True)
+        self._preview.clear()
         self._preview.set_current_thumbnail(video.existing_thumbnail)
         self._preview.show()
         self._apply_btn.setEnabled(False)
@@ -180,6 +190,12 @@ class MainWindow(QMainWindow):
     def _on_scrub(self, offset_ms: int) -> None:
         if self._video is None:
             return
+        if self._frame_extract_active:
+            self._frame_extract_target_ms = offset_ms
+            return
+
+        self._frame_extract_active = True
+        self._frame_extract_target_ms = offset_ms
         self._set_busy(True)
         position = TimelinePosition(offset_ms=offset_ms)
         worker = FrameExtractWorker(self._extractor, self._video, position)
@@ -188,7 +204,7 @@ class MainWindow(QMainWindow):
         self._pool.start(worker)
 
     def _step_selected_frame(self, direction: int) -> None:
-        if self._video is None or not self._timeline.isEnabled():
+        if self._video is None:
             return
 
         current_ms = self._timeline.current_position_ms()
@@ -201,12 +217,34 @@ class MainWindow(QMainWindow):
         self._on_scrub(next_ms)
 
     def _on_frame_extracted(self, image: Image.Image) -> None:
+        self._frame_extract_active = False
+        requested_ms = self._frame_extract_target_ms
+        self._frame_extract_target_ms = None
+        if (
+            requested_ms is not None
+            and requested_ms != self._timeline.current_position_ms()
+        ):
+            self._on_scrub(self._timeline.current_position_ms())
+            return
+
         self._current_frame = image
-        self._preview.set_candidate_frame(image)
+        self._preview.set_candidate_frame(
+            image, self._timeline.current_position_ms()
+        )
         self._apply_btn.setEnabled(True)
         self._set_busy(False)
 
     def _on_extract_error(self, message: str) -> None:
+        self._frame_extract_active = False
+        requested_ms = self._frame_extract_target_ms
+        self._frame_extract_target_ms = None
+        if (
+            requested_ms is not None
+            and requested_ms != self._timeline.current_position_ms()
+        ):
+            self._on_scrub(self._timeline.current_position_ms())
+            return
+
         self._set_busy(False)
         QMessageBox.warning(self, "Frame Extraction Error", message)
 

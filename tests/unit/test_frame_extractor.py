@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from PIL import Image
+from PIL import Image, ImageChops
 
 from video_thumbnailer.core.frame_extractor import PyAVFrameExtractor
 from video_thumbnailer.core.video_loader import PyAVVideoLoader
@@ -23,6 +23,20 @@ def extractor() -> PyAVFrameExtractor:
 
 
 class TestFrameExtractor:
+    def test_extract_at_adjacent_positions_returns_adjacent_frames(
+        self,
+        loader: PyAVVideoLoader,
+        extractor: PyAVFrameExtractor,
+        sample_video: Path,
+    ) -> None:
+        vf = loader.load(str(sample_video))
+        first = extractor.extract(vf, TimelinePosition(offset_ms=0))
+        second = extractor.extract(
+            vf, TimelinePosition(offset_ms=vf.frame_step_ms)
+        )
+
+        assert ImageChops.difference(first, second).getbbox() is not None
+
     def test_extract_at_zero_returns_rgb_image(
         self,
         loader: PyAVVideoLoader,

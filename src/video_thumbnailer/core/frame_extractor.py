@@ -56,20 +56,55 @@ class PyAVFrameExtractor:
             target_us = int(position.offset_ms * 1000)
             container.seek(target_us)
 
-            frame: av.video.frame.VideoFrame | None = None
+            target_seconds = position.offset_ms / 1000
+            best_frame: av.video.frame.VideoFrame | None = None
+            best_distance = float("inf")
+            previous_frame: av.video.frame.VideoFrame | None = None
+            previous_time: float | None = None
+            reached_target = False
             for packet in container.demux(stream):
                 for f in packet.decode():
-                    frame = f
-                    break
-                if frame is not None:
+                    frame_time = f.time
+                    if (
+                        frame_time is None
+                        and f.pts is not None
+                        and f.time_base is not None
+                    ):
+                        frame_time = float(f.pts * f.time_base)
+                    if frame_time is None:
+                        if best_frame is None:
+                            best_frame = f
+                        continue
+
+                    distance = abs(frame_time - target_seconds)
+                    if distance < best_distance:
+                        best_frame = f
+                        best_distance = distance
+
+                    if frame_time >= target_seconds:
+                        if (
+                            previous_frame is not None
+                            and previous_time is not None
+                        ):
+                            if (
+                                target_seconds - previous_time
+                                <= frame_time - target_seconds
+                            ):
+                                best_frame = previous_frame
+                        reached_target = True
+                        break
+
+                    previous_frame = f
+                    previous_time = frame_time
+                if reached_target:
                     break
 
-            if frame is None:
+            if best_frame is None:
                 raise ExtractionError(
                     video.path, position.offset_ms, "no frame decoded after seek"
                 )
 
-            image: Image.Image = frame.to_image().convert("RGB")  # type: ignore[no-untyped-call]
+            image: Image.Image = best_frame.to_image().convert("RGB")  # type: ignore[no-untyped-call]
             return image
         except (ValueError, ExtractionError):
             raise
