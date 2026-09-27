@@ -26,12 +26,18 @@ from pathlib import Path
 __all__ = ["atomic_replace"]
 
 
-def atomic_replace(target_path: Path | str, write_fn: Callable[[Path], None]) -> None:
+def atomic_replace(
+    target_path: Path | str,
+    write_fn: Callable[[Path], None],
+    *,
+    copy_existing: bool = True,
+) -> None:
     """Atomically replace ``target_path`` using ``write_fn``.
 
     Procedure:
         1. Create a temp file in the same directory as ``target_path``.
-        2. If ``target_path`` exists, copy it into the temp file (preserves metadata).
+        2. If ``copy_existing`` is true and ``target_path`` exists, copy it into
+           the temp file (preserves metadata).
         3. Call ``write_fn(tmp_path)`` to write/modify the temp file.
         4. Call ``os.replace(tmp_path, target_path)`` to atomically rename.
 
@@ -55,7 +61,7 @@ def atomic_replace(target_path: Path | str, write_fn: Callable[[Path], None]) ->
         tmp_path = Path(tmp.name)
 
     try:
-        if abs_target.exists():
+        if copy_existing and abs_target.exists():
             shutil.copy2(abs_target, tmp_path)
         write_fn(tmp_path)
         os.replace(tmp_path, abs_target)

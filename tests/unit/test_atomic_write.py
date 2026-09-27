@@ -21,6 +21,17 @@ class TestAtomicReplace:
         atomic_replace(target, write_fn)
         assert target.read_bytes() == b"updated"
 
+    def test_can_skip_copying_existing_target(self, tmp_path: Path) -> None:
+        target = tmp_path / "target.dat"
+        target.write_bytes(b"original")
+
+        def write_fn(path: Path) -> None:
+            assert path.read_bytes() == b""
+            path.write_bytes(b"updated")
+
+        atomic_replace(target, write_fn, copy_existing=False)
+        assert target.read_bytes() == b"updated"
+
     def test_failure_leaves_target_unchanged(self, tmp_path: Path) -> None:
         target = tmp_path / "target.dat"
         target.write_bytes(b"original")

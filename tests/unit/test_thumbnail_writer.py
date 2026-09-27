@@ -6,8 +6,8 @@ from pathlib import Path
 
 import av
 import pytest
-from PIL import Image
 from mutagen.mp4 import MP4
+from PIL import Image, ImageStat
 
 from video_thumbnailer.core.thumbnail_writer import FormatDispatchThumbnailWriter
 from video_thumbnailer.core.video_loader import PyAVVideoLoader
@@ -53,6 +53,18 @@ def _make_flv_video_file(path: Path) -> VideoFile:
 
 
 class TestThumbnailWriter:
+    def _first_playable_frame(self, video_path: Path) -> Image.Image:
+        with av.open(str(video_path)) as container:
+            playable = [
+                stream
+                for stream in container.streams.video
+                if not bool(stream.disposition & stream.disposition.attached_pic)
+            ]
+            assert playable, "Expected at least one playable video stream"
+            for frame in container.decode(playable[0]):
+                return frame.to_image().convert("RGB")  # type: ignore[no-untyped-call]
+        pytest.fail("No playable frame decoded from video")
+
     def test_write_mp4_success(
         self,
         loader: PyAVVideoLoader,
@@ -81,6 +93,58 @@ class TestThumbnailWriter:
         assert tags is not None
         assert "covr" in tags
         assert len(tags["covr"]) == 1
+
+    def test_write_mp4_sets_selected_frame_as_first_video_frame(
+        self,
+        loader: PyAVVideoLoader,
+        writer: FormatDispatchThumbnailWriter,
+        sample_video: Path,
+    ) -> None:
+        vf = loader.load(str(sample_video))
+        with av.open(str(sample_video)) as container:
+            source_packets = [
+                bytes(packet)
+                for packet in container.demux(video=0)
+                if packet.size > 0
+            ]
+        selected = Image.new("RGB", (320, 240), color=(240, 20, 20))
+
+        result = writer.write(vf, selected)
+
+        assert result.success is True
+
+        first_frame = self._first_playable_frame(sample_video)
+        mean = ImageStat.Stat(first_frame).mean
+        assert mean[0] > 150
+        assert mean[0] > mean[1] + 80
+        assert mean[0] > mean[2] + 80
+
+        with av.open(str(sample_video)) as container:
+            playable = [
+                stream
+                for stream in container.streams.video
+                if not bool(stream.disposition & stream.disposition.attached_pic)
+            ]
+            assert playable
+            assert sum(1 for _ in container.decode(playable[0])) >= 100
+
+        with av.open(str(sample_video)) as container:
+            output_packets = [
+                bytes(packet)
+                for packet in container.demux(video=0)
+                if packet.size > 0
+            ]
+        assert output_packets[2:] == source_packets[1:]
+
+        with av.open(str(sample_video)) as container:
+            audio_streams = container.streams.audio
+            assert audio_streams
+            audio_packets = [
+                packet for packet in container.demux(audio_streams[0])
+                if packet.size > 0
+            ]
+            assert audio_packets
+            assert sum(len(packet.decode()) for packet in audio_packets) > 0
 
     def test_write_read_only_returns_error(
         self,
