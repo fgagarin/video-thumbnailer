@@ -6,16 +6,19 @@ from typing import TYPE_CHECKING
 
 from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QPixmap
-from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
+)
 
 if TYPE_CHECKING:
     from PIL.Image import Image as PILImage
 
 __all__ = ["PreviewWidget"]
-
-_THUMB_W = 240
-_THUMB_H = 135
-
 
 def _pil_to_pixmap(image: PILImage) -> QPixmap:
     """Convert a PIL Image to a QPixmap (via QImage)."""
@@ -52,6 +55,8 @@ class PreviewWidget(QWidget):
         self._candidate_title, self._candidate_label = self._make_panel(
             layout, "Selected Frame"
         )
+        self._current_pixmap: QPixmap | None = None
+        self._candidate_pixmap: QPixmap | None = None
 
         self._show_placeholder(self._current_label, "No current thumbnail")
         self._show_placeholder(self._candidate_label, "No frame selected")
@@ -63,9 +68,11 @@ class PreviewWidget(QWidget):
     def set_current_thumbnail(self, image: PILImage | None) -> None:
         """Display the current embedded thumbnail, or placeholder if None."""
         if image is None:
+            self._current_pixmap = None
             self._show_placeholder(self._current_label, "No current thumbnail")
         else:
-            self._show_pixmap(self._current_label, image)
+            self._current_pixmap = _pil_to_pixmap(image)
+            self._refresh_pixmaps()
 
     def set_candidate_frame(
         self, image: PILImage, position_ms: int | None = None
@@ -77,16 +84,23 @@ class PreviewWidget(QWidget):
             self._candidate_title.setText(
                 f"Selected Frame ({self._format_position(position_ms)})"
             )
-        self._show_pixmap(self._candidate_label, image)
+        self._candidate_pixmap = _pil_to_pixmap(image)
+        self._refresh_pixmaps()
 
     def clear(self) -> None:
         """Reset both panels to their placeholder states."""
+        self._current_pixmap = None
+        self._candidate_pixmap = None
         self._show_placeholder(self._current_label, "No current thumbnail")
         self._show_placeholder(self._candidate_label, "No frame selected")
         self._candidate_title.setText("Selected Frame")
 
     def sizeHint(self) -> QSize:
-        return QSize(540, 165)
+        return QSize(540, 220)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._refresh_pixmaps()
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -107,8 +121,11 @@ class PreviewWidget(QWidget):
 
         img_label = QLabel()
         img_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        img_label.setMinimumSize(_THUMB_W, _THUMB_H)
-        vbox.addWidget(img_label)
+        img_label.setMinimumSize(0, 0)
+        img_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored
+        )
+        vbox.addWidget(img_label, 1)
 
         parent_layout.addWidget(frame)
         return title_label, img_label
@@ -123,12 +140,18 @@ class PreviewWidget(QWidget):
         label.setPixmap(QPixmap())
         label.setText(f"<i style='color: grey;'>{text}</i>")
 
-    def _show_pixmap(self, label: QLabel, image: PILImage) -> None:
-        pixmap = _pil_to_pixmap(image)
-        scaled = pixmap.scaled(
-            _THUMB_W, _THUMB_H,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        label.setText("")
-        label.setPixmap(scaled)
+    def _refresh_pixmaps(self) -> None:
+        for label, pixmap in (
+            (self._current_label, self._current_pixmap),
+            (self._candidate_label, self._candidate_pixmap),
+        ):
+            if pixmap is None or label.width() <= 0 or label.height() <= 0:
+                continue
+            label.setText("")
+            label.setPixmap(
+                pixmap.scaled(
+                    label.size(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )

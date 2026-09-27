@@ -70,4 +70,25 @@ class TestPreviewWidget:
         assert preview._candidate_title.text() == "Selected Frame"
 
     def test_size_hint(self, preview: PreviewWidget) -> None:
-        assert preview.sizeHint() == QSize(540, 165)
+        assert preview.sizeHint() == QSize(540, 220)
+
+    def test_candidate_image_scales_with_widget_and_keeps_aspect_ratio(
+        self, preview: PreviewWidget, qtbot
+    ) -> None:
+        image = Image.new("RGB", (1920, 1080))
+        preview.resize(760, 300)
+        preview.set_candidate_frame(image)
+        preview.show()
+        qtbot.wait(50)
+
+        large_pixmap = preview._candidate_label.pixmap()
+        assert large_pixmap is not None
+        large_ratio = large_pixmap.width() / large_pixmap.height()
+        assert abs(large_ratio - 16 / 9) < 0.02
+
+        preview.resize(460, 260)
+        qtbot.wait(50)
+        small_pixmap = preview._candidate_label.pixmap()
+        assert small_pixmap is not None
+        assert small_pixmap.width() < large_pixmap.width()
+        assert abs(small_pixmap.width() / small_pixmap.height() - 16 / 9) < 0.02

@@ -66,13 +66,12 @@ class TestMainWindowConstruction:
     def test_preview_hidden_initially(self, window: MainWindow) -> None:
         assert not window._preview.isVisible()
 
+    def test_video_controls_hidden_initially(self, window: MainWindow) -> None:
+        assert not window._timeline.isVisible()
+        assert not window._apply_btn.isVisible()
+
     def test_drop_zone_visible(self, window: MainWindow) -> None:
         assert window._drop_label.isVisible()
-
-    def test_hotkeys_help_visible(self, window: MainWindow) -> None:
-        assert "Left Arrow" in window._hotkeys_label.text()
-        assert "Right Arrow" in window._hotkeys_label.text()
-
 
 class TestMainWindowVideoLoading:
     def test_on_video_loaded_updates_ui(self, window: MainWindow) -> None:
@@ -82,7 +81,17 @@ class TestMainWindowVideoLoading:
         assert window._video is vf
         assert window._timeline.isEnabled()
         assert window._preview.isVisible()
+        assert window._timeline.isVisible()
+        assert window._apply_btn.isVisible()
+        assert not window._drop_label.isVisible()
         assert not window._apply_btn.isEnabled()  # no frame yet
+
+    def test_loaded_layout_places_preview_above_timeline(self, window: MainWindow) -> None:
+        window._on_video_loaded(_make_vf())
+        layout = window.centralWidget().layout()
+
+        assert layout.indexOf(window._preview) < layout.indexOf(window._timeline)
+        assert layout.indexOf(window._timeline) < layout.indexOf(window._apply_btn)
 
     def test_on_video_loaded_with_existing_thumb(self, window: MainWindow) -> None:
         vf = _make_vf(with_thumb=True)

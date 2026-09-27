@@ -100,27 +100,22 @@ class MainWindow(QMainWindow):
         )
         layout.addWidget(self._drop_label)
 
-        # Timeline scrubber
-        self._timeline = TimelineWidget()
-        self._timeline.setEnabled(False)
-        self._timeline.positionChanged.connect(self._on_scrub)
-        layout.addWidget(self._timeline)
-
-        self._hotkeys_label = QLabel(
-            "Hotkeys: Left Arrow - previous frame, Right Arrow - next frame"
-        )
-        self._hotkeys_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._hotkeys_label.setStyleSheet("color: #666666; font-size: 12px;")
-        layout.addWidget(self._hotkeys_label)
-
         # Side-by-side preview (hidden until a video is loaded)
         self._preview = PreviewWidget()
         self._preview.hide()
         layout.addWidget(self._preview)
 
+        # Timeline scrubber
+        self._timeline = TimelineWidget()
+        self._timeline.setEnabled(False)
+        self._timeline.hide()
+        self._timeline.positionChanged.connect(self._on_scrub)
+        layout.addWidget(self._timeline)
+
         # Apply button
         self._apply_btn = QPushButton("Apply Thumbnail")
         self._apply_btn.setEnabled(False)
+        self._apply_btn.hide()
         self._apply_btn.clicked.connect(self._on_apply_clicked)
         layout.addWidget(self._apply_btn)
 
@@ -172,14 +167,21 @@ class MainWindow(QMainWindow):
         )
         self._timeline.set_duration(video.duration_ms)
         self._timeline.setEnabled(True)
+        self._drop_label.hide()
         self._preview.clear()
         self._preview.set_current_thumbnail(video.existing_thumbnail)
         self._preview.show()
+        self._timeline.show()
+        self._apply_btn.show()
         self._apply_btn.setEnabled(False)
         self._set_busy(False)
 
     def _on_load_error(self, message: str) -> None:
         self._drop_label.setText("Drop a video file here")
+        self._drop_label.show()
+        self._preview.hide()
+        self._timeline.hide()
+        self._apply_btn.hide()
         self._set_busy(False)
         QMessageBox.critical(self, "Load Error", message)
 
