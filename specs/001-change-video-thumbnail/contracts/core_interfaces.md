@@ -89,7 +89,13 @@ from PIL import Image
 from video_thumbnailer.models import VideoFile, ApplyResult
 
 class ThumbnailWriter(Protocol):
-    def write(self, video: VideoFile, thumbnail: Image.Image) -> ApplyResult:
+    def write(
+        self,
+        video: VideoFile,
+        thumbnail: Image.Image,
+        *,
+        position_ms: int | None = None,
+    ) -> ApplyResult:
         """
         Embed `thumbnail` as the cover-art track of `video` using the
         format-appropriate mechanism.

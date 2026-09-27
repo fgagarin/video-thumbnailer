@@ -19,6 +19,7 @@ import imageio_ffmpeg  # type: ignore[import-untyped]
 from PIL import Image
 
 from video_thumbnailer.core.atomic_write import atomic_replace
+from video_thumbnailer.core.thumbnail_metadata import write_thumbnail_source
 from video_thumbnailer.models import ApplyError, ApplyResult, VideoFile, VideoFormat
 
 __all__ = ["FormatDispatchThumbnailWriter"]
@@ -57,7 +58,13 @@ class FormatDispatchThumbnailWriter:
     left in a corrupt state on failure.
     """
 
-    def write(self, video: VideoFile, thumbnail: Image.Image) -> ApplyResult:
+    def write(
+        self,
+        video: VideoFile,
+        thumbnail: Image.Image,
+        *,
+        position_ms: int | None = None,
+    ) -> ApplyResult:
         """Embed ``thumbnail`` as cover art in ``video``.
 
         Args:
@@ -122,6 +129,12 @@ class FormatDispatchThumbnailWriter:
                     video.path,
                     jpeg_bytes,
                     frame_bytes,
+                    position_ms=position_ms,
+                    frame_number=(
+                        round(position_ms / max(1, video.frame_step_ms))
+                        if position_ms is not None
+                        else None
+                    ),
                     write_mp4_covr=video.format is VideoFormat.MP4,
                 )
             elif video.format in _MKV_FORMATS:
@@ -187,6 +200,8 @@ class FormatDispatchThumbnailWriter:
         jpeg_bytes: bytes,
         frame_bytes: bytes,
         *,
+        position_ms: int | None,
+        frame_number: int | None,
         write_mp4_covr: bool,
     ) -> None:
         """Embed a preview and cover art into an MP4 or MOV file."""
@@ -230,6 +245,9 @@ class FormatDispatchThumbnailWriter:
                 ):
                     if write_mp4_covr:
                         self._write_mp4_covr_tag(tmp_video_path, jpeg_bytes)
+                    self._write_source_metadata(
+                        tmp_video_path, frame_number, position_ms
+                    )
                     return
 
                 subprocess.run(
@@ -263,6 +281,9 @@ class FormatDispatchThumbnailWriter:
                 )
                 if write_mp4_covr:
                     self._write_mp4_covr_tag(tmp_video_path, jpeg_bytes)
+                self._write_source_metadata(
+                    tmp_video_path, frame_number, position_ms
+                )
 
             atomic_replace(video_path, _ffmpeg_write_fn, copy_existing=False)
         finally:
@@ -409,6 +430,13 @@ class FormatDispatchThumbnailWriter:
         tags.tags = tags.tags or {}
         tags.tags["covr"] = [MP4Cover(jpeg_bytes, imageformat=_MP4_COVER_FORMAT_JPEG)]
         tags.save()
+
+    @staticmethod
+    def _write_source_metadata(
+        video_path: Path, frame_number: int | None, position_ms: int | None
+    ) -> None:
+        if frame_number is not None and position_ms is not None:
+            write_thumbnail_source(video_path, frame_number, position_ms)
 
     def _embed_mkv_webm(self, video_path: str, jpeg_bytes: bytes) -> None:
         """Embed cover art into an MKV or WebM file using ffmpeg -attach."""

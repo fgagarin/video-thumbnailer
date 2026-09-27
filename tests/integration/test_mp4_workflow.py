@@ -95,12 +95,14 @@ class TestMp4Workflow:
         start = time.monotonic()
         vf = loader.load(str(mov_path))
         frame = extractor.extract(vf, type("Pos", (), {"offset_ms": 2500})())
-        result = writer.write(vf, frame)
+        result = writer.write(vf, frame, position_ms=2500)
         elapsed = (time.monotonic() - start) * 1000
 
         assert result.success is True
         assert elapsed < 10_000, f"Pipeline took {elapsed:.0f}ms (limit: 10000ms)"
         assert _has_attached_pic_stream(mov_path), "MOV has no attached_pic after write"
+        reopened = loader.load(str(mov_path))
+        assert reopened.thumbnail_position_ms == 2500
 
     def test_pipeline_under_3_seconds(
         self,

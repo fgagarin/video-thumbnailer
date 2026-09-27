@@ -49,6 +49,8 @@ class VideoFile:
         existing_thumbnail: Current embedded cover-art image, or None if absent.
         is_writable: Whether the file is writable by the current user.
         frame_step_ms: Approximate duration of one video frame in milliseconds.
+        thumbnail_frame_number: Frame number saved with the existing thumbnail.
+        thumbnail_position_ms: Timeline position saved with the existing thumbnail.
     """
 
     path: str
@@ -59,6 +61,8 @@ class VideoFile:
     existing_thumbnail: PILImage.Image | None
     is_writable: bool
     frame_step_ms: int = 40
+    thumbnail_frame_number: int | None = None
+    thumbnail_position_ms: int | None = None
 
 
 @dataclass

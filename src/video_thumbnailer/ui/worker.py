@@ -112,18 +112,24 @@ class ApplyWorker(QRunnable):
         invalidator: CacheInvalidator,
         video: VideoFile,
         thumbnail: Image.Image,
+        position_ms: int | None = None,
     ) -> None:
         super().__init__()
         self._writer = writer
         self._invalidator = invalidator
         self._video = video
         self._thumbnail = thumbnail
+        self._position_ms = position_ms
         self.signals = _ApplySignals()
 
     @Slot()
     def run(self) -> None:
         try:
-            result = self._writer.write(self._video, self._thumbnail)
+            result = self._writer.write(
+                self._video,
+                self._thumbnail,
+                position_ms=self._position_ms,
+            )
             if result.success:
                 self._invalidator.invalidate(self._video)
             self.signals.finished.emit(result)

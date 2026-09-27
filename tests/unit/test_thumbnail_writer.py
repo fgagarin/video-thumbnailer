@@ -94,6 +94,22 @@ class TestThumbnailWriter:
         assert "covr" in tags
         assert len(tags["covr"]) == 1
 
+    def test_write_mp4_saves_selected_frame_source(
+        self,
+        loader: PyAVVideoLoader,
+        writer: FormatDispatchThumbnailWriter,
+        sample_video: Path,
+        sample_pil_image: Image.Image,
+    ) -> None:
+        video = loader.load(str(sample_video))
+
+        result = writer.write(video, sample_pil_image, position_ms=1680)
+
+        assert result.success is True
+        reopened = loader.load(str(sample_video))
+        assert reopened.thumbnail_position_ms == 1680
+        assert reopened.thumbnail_frame_number == 42
+
     def test_write_mp4_sets_selected_frame_as_first_video_frame(
         self,
         loader: PyAVVideoLoader,

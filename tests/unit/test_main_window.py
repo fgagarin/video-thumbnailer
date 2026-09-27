@@ -6,7 +6,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from PIL import Image
-from PySide6.QtWidgets import QMessageBox
+from PySide6.QtCore import QSettings, Qt
+from PySide6.QtGui import QKeySequence
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QFileDialog, QMessageBox
 
 from video_thumbnailer.core.frame_extractor import PyAVFrameExtractor
 from video_thumbnailer.core.thumbnail_writer import FormatDispatchThumbnailWriter
@@ -48,6 +51,7 @@ def deps():
 def window(qtbot, deps):  # type: ignore[type-arg]
     loader, extractor, writer, invalidator = deps
     w = MainWindow(loader, extractor, writer, invalidator)
+    w._on_scrub = MagicMock()
     qtbot.addWidget(w)
     w.show()
     return w
@@ -73,6 +77,10 @@ class TestMainWindowConstruction:
     def test_drop_zone_visible(self, window: MainWindow) -> None:
         assert window._drop_label.isVisible()
 
+    def test_default_window_is_wide(self, window: MainWindow) -> None:
+        assert window.width() >= 1200
+        assert window.height() >= 700
+
 class TestMainWindowVideoLoading:
     def test_on_video_loaded_updates_ui(self, window: MainWindow) -> None:
         vf = _make_vf()
@@ -85,6 +93,102 @@ class TestMainWindowVideoLoading:
         assert window._apply_btn.isVisible()
         assert not window._drop_label.isVisible()
         assert not window._apply_btn.isEnabled()  # no frame yet
+
+    def test_on_video_loaded_restores_saved_thumbnail_position(
+        self, window: MainWindow
+    ) -> None:
+        video = _make_vf()
+        video.thumbnail_frame_number = 80
+        video.thumbnail_position_ms = 3210
+
+        window._on_video_loaded(video)
+
+        assert window._timeline.current_position_ms() == 3210
+        assert window._path_label.text() == video.path
+        assert window._path_label.isVisible()
+        assert window._open_video_btn.isVisible()
+        window._on_scrub.assert_called_once_with(3210)
+
+    def test_open_video_button_opens_file_dialog(
+        self, window: MainWindow, tmp_path
+    ) -> None:
+        window._last_open_directory = str(tmp_path)
+
+        with (
+            patch.object(
+                QFileDialog, "getOpenFileName", return_value=("", "")
+            ) as get_open_file,
+            patch.object(window, "_load_video") as load_video,
+        ):
+            window._open_video_btn.click()
+
+        assert get_open_file.call_args.args[2] == str(tmp_path)
+        load_video.assert_not_called()
+
+    def test_drop_zone_click_opens_file_dialog(self, window: MainWindow) -> None:
+        with patch.object(
+            QFileDialog, "getOpenFileName", return_value=("", "")
+        ) as get_open_file:
+            QTest.mouseClick(window._drop_label, Qt.MouseButton.LeftButton)
+
+        get_open_file.assert_called_once()
+
+    def test_load_remembers_last_open_directory(
+        self, window: MainWindow, tmp_path
+    ) -> None:
+        settings = QSettings(
+            str(tmp_path / "settings.ini"), QSettings.Format.IniFormat
+        )
+        window._settings = settings
+        video_path = str(tmp_path / "clips" / "clip.mp4")
+
+        with patch.object(window._pool, "start"):
+            window._load_video(video_path)
+
+        assert settings.value("lastOpenDirectory") == str(tmp_path / "clips")
+
+    def test_path_click_reveals_video_in_windows_explorer(
+        self, window: MainWindow
+    ) -> None:
+        window._on_video_loaded(_make_vf("C:/videos/clip.mp4"))
+
+        with (
+            patch("video_thumbnailer.ui.main_window.sys.platform", "win32"),
+            patch("video_thumbnailer.ui.main_window.subprocess.Popen") as popen,
+        ):
+            QTest.mouseClick(window._path_label, Qt.MouseButton.LeftButton)
+
+        popen.assert_called_once_with(
+            ["explorer.exe", "/select,", "C:/videos/clip.mp4"]
+        )
+
+    def test_shortcuts_include_open_save_and_help(self, window: MainWindow) -> None:
+        shortcut_text = {
+            shortcut.key().toString(QKeySequence.SequenceFormat.PortableText)
+            for shortcut in window._shortcuts
+        }
+
+        assert shortcut_text == {"Ctrl+O", "Ctrl+S", "Shift+/"}
+
+    def test_on_video_loaded_restores_from_frame_number_when_no_timestamp(
+        self, window: MainWindow
+    ) -> None:
+        video = _make_vf()
+        video.thumbnail_frame_number = 40
+
+        window._on_video_loaded(video)
+
+        assert window._timeline.current_position_ms() == 40 * video.frame_step_ms
+
+    def test_on_video_loaded_randomizes_in_second_third_when_no_metadata(
+        self, window: MainWindow
+    ) -> None:
+        video = _make_vf()
+        with patch("video_thumbnailer.ui.main_window.random.randint", return_value=2500) as randint:
+            window._on_video_loaded(video)
+
+        randint.assert_called_once_with(video.duration_ms // 3, video.duration_ms * 2 // 3)
+        assert window._timeline.current_position_ms() == 2500
 
     def test_loaded_layout_places_preview_above_timeline(self, window: MainWindow) -> None:
         window._on_video_loaded(_make_vf())

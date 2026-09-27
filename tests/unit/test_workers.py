@@ -128,6 +128,18 @@ class TestApplyWorker:
         assert finished[0].success is True
         assert errors == []
 
+    def test_run_passes_selected_position_to_writer(self) -> None:
+        writer = MagicMock(spec=FormatDispatchThumbnailWriter)
+        writer.write.return_value = ApplyResult(success=True)
+        invalidator = MagicMock()
+        vf = _make_vf()
+        thumbnail = Image.new("RGB", (10, 10))
+
+        worker = ApplyWorker(writer, invalidator, vf, thumbnail, position_ms=1680)
+        _run_worker(worker)
+
+        writer.write.assert_called_once_with(vf, thumbnail, position_ms=1680)
+
     def test_run_failure_result_skips_invalidator(self) -> None:
         writer = MagicMock(spec=FormatDispatchThumbnailWriter)
         from video_thumbnailer.models import ApplyError

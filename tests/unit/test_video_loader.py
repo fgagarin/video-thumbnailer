@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 
 import pytest
+from mutagen.mp4 import MP4, MP4FreeForm
 
 from video_thumbnailer.core.video_loader import PyAVVideoLoader
 from video_thumbnailer.exceptions import UnsupportedFormatError
@@ -18,6 +19,24 @@ def loader() -> PyAVVideoLoader:
 
 
 class TestVideoLoaderBasic:
+    def test_loads_saved_thumbnail_source_metadata(
+        self, loader: PyAVVideoLoader, sample_video: Path
+    ) -> None:
+        tags = MP4(str(sample_video))
+        tags.tags = tags.tags or {}
+        tags.tags[
+            "----:com.apple.iTunes:video-thumbnailer-frame-number"
+        ] = [MP4FreeForm(b"42")]
+        tags.tags[
+            "----:com.apple.iTunes:video-thumbnailer-position-ms"
+        ] = [MP4FreeForm(b"1680")]
+        tags.save()
+
+        video = loader.load(str(sample_video))
+
+        assert video.thumbnail_frame_number == 42
+        assert video.thumbnail_position_ms == 1680
+
     def test_load_mp4_returns_video_file(self, loader: PyAVVideoLoader, sample_video: Path) -> None:
         vf = loader.load(str(sample_video))
         assert isinstance(vf, VideoFile)

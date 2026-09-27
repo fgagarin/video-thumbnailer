@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import av
 from PIL import Image
 
+from video_thumbnailer.core.thumbnail_metadata import read_thumbnail_source
 from video_thumbnailer.exceptions import NoVideoStreamError, UnsupportedFormatError
 from video_thumbnailer.models import VideoFile, VideoFormat
 
@@ -184,6 +185,11 @@ class PyAVVideoLoader:
             container.close()
 
         is_writable = os.access(abs_path, os.W_OK)
+        thumbnail_frame_number, thumbnail_position_ms = (
+            read_thumbnail_source(abs_path)
+            if fmt in (VideoFormat.MP4, VideoFormat.MOV)
+            else (None, None)
+        )
 
         return VideoFile(
             path=abs_path,
@@ -194,4 +200,6 @@ class PyAVVideoLoader:
             existing_thumbnail=existing_thumbnail,
             is_writable=is_writable,
             frame_step_ms=frame_step_ms,
+            thumbnail_frame_number=thumbnail_frame_number,
+            thumbnail_position_ms=thumbnail_position_ms,
         )
