@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
 )
 
 from video_thumbnailer.models import ApplyResult, TimelinePosition, VideoFile
+from video_thumbnailer.ui.filmstrip_widget import FilmstripWidget
 from video_thumbnailer.ui.preview_widget import PreviewWidget
 from video_thumbnailer.ui.timeline_widget import TimelineWidget
 from video_thumbnailer.ui.worker import ApplyWorker, FrameExtractWorker, VideoLoadWorker
@@ -176,6 +177,11 @@ class MainWindow(QMainWindow):
         self._preview.hide()
         layout.addWidget(self._preview)
 
+        self._filmstrip = FilmstripWidget()
+        self._filmstrip.hide()
+        self._filmstrip.positionSelected.connect(self._on_filmstrip_position_selected)
+        layout.addWidget(self._filmstrip)
+
         # Timeline scrubber
         self._timeline = TimelineWidget()
         self._timeline.setEnabled(False)
@@ -263,9 +269,11 @@ class MainWindow(QMainWindow):
         self._drop_label.hide()
         self._path_label.setText(video.path)
         self._path_container.show()
+        self._filmstrip.set_video(video, self._extractor)
         self._preview.clear()
         self._preview.set_current_thumbnail(video.existing_thumbnail)
         self._preview.show()
+        self._filmstrip.show()
         self._timeline.show()
         self._apply_btn.show()
         self._apply_btn.setEnabled(False)
@@ -279,6 +287,8 @@ class MainWindow(QMainWindow):
         self._path_container.hide()
         self._preview.hide()
         self._timeline.hide()
+        self._filmstrip.hide()
+        self._filmstrip.set_video(None)
         self._apply_btn.hide()
         self._set_busy(False)
         QMessageBox.critical(self, "Load Error", message)
@@ -290,6 +300,7 @@ class MainWindow(QMainWindow):
     def _on_scrub(self, offset_ms: int) -> None:
         if self._video is None:
             return
+        self._filmstrip.set_selected_position(offset_ms)
         if self._frame_extract_active:
             self._frame_extract_target_ms = offset_ms
             return
@@ -315,6 +326,10 @@ class MainWindow(QMainWindow):
 
         self._timeline.set_position(next_ms)
         self._on_scrub(next_ms)
+
+    def _on_filmstrip_position_selected(self, offset_ms: int) -> None:
+        self._timeline.set_position(offset_ms)
+        self._on_scrub(offset_ms)
 
     def _on_frame_extracted(self, image: Image.Image) -> None:
         self._frame_extract_active = False

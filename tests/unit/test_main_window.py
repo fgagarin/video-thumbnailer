@@ -52,6 +52,7 @@ def window(qtbot, deps):  # type: ignore[type-arg]
     loader, extractor, writer, invalidator = deps
     w = MainWindow(loader, extractor, writer, invalidator)
     w._on_scrub = MagicMock()
+    w._filmstrip.set_video = MagicMock()
     qtbot.addWidget(w)
     w.show()
     return w
@@ -72,6 +73,7 @@ class TestMainWindowConstruction:
 
     def test_video_controls_hidden_initially(self, window: MainWindow) -> None:
         assert not window._timeline.isVisible()
+        assert not window._filmstrip.isVisible()
         assert not window._apply_btn.isVisible()
 
     def test_drop_zone_visible(self, window: MainWindow) -> None:
@@ -89,6 +91,7 @@ class TestMainWindowVideoLoading:
         assert window._video is vf
         assert window._timeline.isEnabled()
         assert window._preview.isVisible()
+        assert window._filmstrip.isVisible()
         assert window._timeline.isVisible()
         assert window._apply_btn.isVisible()
         assert not window._drop_label.isVisible()
@@ -195,7 +198,21 @@ class TestMainWindowVideoLoading:
         layout = window.centralWidget().layout()
 
         assert layout.indexOf(window._preview) < layout.indexOf(window._timeline)
+        assert layout.indexOf(window._preview) < layout.indexOf(window._filmstrip)
+        assert layout.indexOf(window._filmstrip) < layout.indexOf(window._timeline)
         assert layout.indexOf(window._timeline) < layout.indexOf(window._apply_btn)
+        assert window._filmstrip.width() == window._timeline.width()
+
+    def test_filmstrip_selection_moves_timeline_and_extracts_frame(
+        self, window: MainWindow
+    ) -> None:
+        window._on_video_loaded(_make_vf())
+        position_ms = 2100
+
+        window._filmstrip.positionSelected.emit(position_ms)
+
+        assert window._timeline.current_position_ms() == position_ms
+        window._on_scrub.assert_called_with(position_ms)
 
     def test_on_video_loaded_with_existing_thumb(self, window: MainWindow) -> None:
         vf = _make_vf(with_thumb=True)
