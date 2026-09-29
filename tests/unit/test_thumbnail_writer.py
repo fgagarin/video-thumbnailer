@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
 import av
 import pytest
@@ -76,6 +79,29 @@ class TestThumbnailWriter:
         result = writer.write(vf, sample_pil_image)
         assert result.success is True
         assert result.elapsed_ms >= 0
+
+    def test_write_mp4_runs_ffmpeg_without_console(
+        self,
+        loader: PyAVVideoLoader,
+        writer: FormatDispatchThumbnailWriter,
+        sample_video: Path,
+        sample_pil_image: Image.Image,
+    ) -> None:
+        video = loader.load(str(sample_video))
+
+        with patch(
+            "video_thumbnailer.core.thumbnail_writer.subprocess.run",
+            wraps=subprocess.run,
+        ) as run:
+            result = writer.write(video, sample_pil_image)
+
+        assert result.success is True
+        assert run.call_count > 0
+        expected_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        assert all(
+            call.kwargs["creationflags"] == expected_flags
+            for call in run.call_args_list
+        )
 
     def test_write_mp4_adds_covr_tag(
         self,

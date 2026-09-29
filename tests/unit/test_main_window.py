@@ -159,11 +159,69 @@ class TestMainWindowVideoLoading:
             patch("video_thumbnailer.ui.main_window.sys.platform", "win32"),
             patch("video_thumbnailer.ui.main_window.subprocess.Popen") as popen,
         ):
-            QTest.mouseClick(window._path_label, Qt.MouseButton.LeftButton)
+            QTest.mouseClick(
+                window._path_label,
+                Qt.MouseButton.LeftButton,
+                pos=QPoint(10, window._path_label.height() // 2),
+            )
 
         popen.assert_called_once_with(
             ["explorer.exe", "/select,", "C:/videos/clip.mp4"]
         )
+
+    def test_path_uses_available_width_before_wrapping(
+        self, window: MainWindow
+    ) -> None:
+        path = "C:/videos/holiday clips/clip.mp4"
+        window._on_video_loaded(_make_vf(path))
+
+        label = window._path_label
+        assert label.width() > label.fontMetrics().horizontalAdvance(path)
+        assert label.height() < label.fontMetrics().height() * 2
+
+    def test_path_blank_space_is_not_clickable(self, window: MainWindow) -> None:
+        window._on_video_loaded(_make_vf("C:/videos/clip.mp4"))
+        label = window._path_label
+        empty_space = window._path_container
+        blank_point = QPoint(empty_space.width() - 2, label.height() // 2)
+
+        assert label.width() <= label.fontMetrics().horizontalAdvance(label.text()) + 2
+        assert label.geometry().right() < blank_point.x()
+        assert empty_space.cursor().shape() == Qt.CursorShape.ArrowCursor
+
+        with patch("video_thumbnailer.ui.main_window.subprocess.Popen") as popen:
+            QTest.mouseClick(
+                empty_space,
+                Qt.MouseButton.LeftButton,
+                pos=blank_point,
+            )
+
+        popen.assert_not_called()
+
+    def test_wrapped_path_only_clicks_on_text(self, window: MainWindow) -> None:
+        path = "C:/videos/" + "holiday clip " * 80 + "clip.mp4"
+        window._on_video_loaded(_make_vf(path))
+        label = window._path_label
+        line_height = label.fontMetrics().height()
+        assert label.height() >= line_height * 2
+
+        with (
+            patch("video_thumbnailer.ui.main_window.sys.platform", "win32"),
+            patch("video_thumbnailer.ui.main_window.subprocess.Popen") as popen,
+        ):
+            QTest.mouseClick(
+                label,
+                Qt.MouseButton.LeftButton,
+                pos=QPoint(label.width() - 2, label.height() - line_height // 2),
+            )
+            popen.assert_not_called()
+            QTest.mouseClick(
+                label,
+                Qt.MouseButton.LeftButton,
+                pos=QPoint(10, label.height() // 2),
+            )
+
+        popen.assert_called_once_with(["explorer.exe", "/select,", path])
 
     def test_shortcuts_include_open_save_and_help(self, window: MainWindow) -> None:
         shortcut_text = {

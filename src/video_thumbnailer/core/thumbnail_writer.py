@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 _MAX_THUMB_W = 640
 _MAX_THUMB_H = 360
 _JPEG_QUALITY = 90
+_FFMPEG_CREATION_FLAGS = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
 _MP4_MOV_FORMATS = frozenset({VideoFormat.MP4, VideoFormat.MOV})
 _MKV_FORMATS = frozenset({VideoFormat.MKV})
@@ -278,6 +279,7 @@ class FormatDispatchThumbnailWriter:
                     ],
                     check=True,
                     capture_output=True,
+                    creationflags=_FFMPEG_CREATION_FLAGS,
                 )
                 if write_mp4_covr:
                     self._write_mp4_covr_tag(tmp_video_path, jpeg_bytes)
@@ -378,6 +380,7 @@ class FormatDispatchThumbnailWriter:
             ],
             check=True,
             capture_output=True,
+            creationflags=_FFMPEG_CREATION_FLAGS,
         )
         with av.open(preview_path) as preview:
             preview_stream = preview.streams.video[0]
@@ -419,6 +422,7 @@ class FormatDispatchThumbnailWriter:
             ],
             check=True,
             capture_output=True,
+            creationflags=_FFMPEG_CREATION_FLAGS,
         )
         return True
 
@@ -469,6 +473,7 @@ class FormatDispatchThumbnailWriter:
                         ],
                         check=True,
                         capture_output=True,
+                        creationflags=_FFMPEG_CREATION_FLAGS,
                     )
                     os.replace(out_path, tmp_video_path)
                 except Exception:
@@ -505,6 +510,7 @@ class FormatDispatchThumbnailWriter:
                     ],
                     check=True,
                     capture_output=True,
+                    creationflags=_FFMPEG_CREATION_FLAGS,
                 )
                 os.replace(out_path, tmp_video_path)
             except Exception:

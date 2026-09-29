@@ -9,17 +9,30 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from PIL import Image
-from PySide6.QtCore import QRect, QSettings, Qt, QThreadPool, QTimer, QUrl, Signal
+from PySide6.QtCore import (
+    QPoint,
+    QRect,
+    QSettings,
+    QSize,
+    Qt,
+    QThreadPool,
+    QTimer,
+    QUrl,
+    Signal,
+)
 from PySide6.QtGui import (
     QColor,
     QDesktopServices,
     QDropEvent,
     QIcon,
     QKeySequence,
+    QMouseEvent,
     QPainter,
     QPen,
     QPixmap,
     QShortcut,
+    QTextLayout,
+    QTextOption,
 )
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -56,13 +69,46 @@ _VIDEO_FILE_FILTER = (
 class _ClickableLabel(QLabel):
     clicked = Signal()
 
-    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         super().mouseReleaseEvent(event)
         if (
             event.button() == Qt.MouseButton.LeftButton
             and not self.selectedText()
+            and self._is_clickable_position(event.position().toPoint())
         ):
             self.clicked.emit()
+
+    def _is_clickable_position(self, position: QPoint) -> bool:
+        return True
+
+
+class _PathLabel(_ClickableLabel):
+    def sizeHint(self) -> QSize:  # noqa: N802
+        hint = super().sizeHint()
+        hint.setWidth(self.fontMetrics().horizontalAdvance(self.text()) + 2)
+        return hint
+
+    def _is_clickable_position(self, position: QPoint) -> bool:
+        rect = self.contentsRect()
+        layout = QTextLayout(self.text(), self.font())
+        option = QTextOption()
+        option.setWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+        layout.setTextOption(option)
+        layout.beginLayout()
+        lines = []
+        height = 0.0
+        while (line := layout.createLine()).isValid():
+            line.setLineWidth(rect.width())
+            lines.append((height, line.height(), line.naturalTextWidth()))
+            height += line.height()
+        layout.endLayout()
+
+        x = position.x() - rect.x()
+        y = position.y() - rect.y() - (rect.height() - height) / 2
+        return any(
+            top <= y < top + line_height and 0 <= x < text_width
+            for top, line_height, text_width in lines
+        )
 
 
 class MainWindow(QMainWindow):
@@ -162,7 +208,7 @@ class MainWindow(QMainWindow):
         self._open_video_btn.clicked.connect(self._open_file_dialog)
         path_layout.addWidget(self._open_video_btn)
 
-        self._path_label = _ClickableLabel()
+        self._path_label = _PathLabel()
         self._path_label.setWordWrap(True)
         self._path_label.setTextFormat(Qt.TextFormat.PlainText)
         self._path_label.setTextInteractionFlags(
@@ -172,7 +218,8 @@ class MainWindow(QMainWindow):
         self._path_label.setToolTip("Show video in containing folder")
         self._path_label.clicked.connect(self._show_video_in_folder)
         self._path_label.setStyleSheet("color: #666666; font-size: 12px;")
-        path_layout.addWidget(self._path_label, 1)
+        path_layout.addWidget(self._path_label)
+        path_layout.addStretch(1)
 
         self._path_container.hide()
         layout.addWidget(self._path_container)
