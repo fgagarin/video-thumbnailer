@@ -444,6 +444,7 @@ class MainWindow(QMainWindow):
         )
         worker.signals.finished.connect(self._on_apply_done)
         worker.signals.error.connect(self._on_apply_error)
+        worker.signals.progress.connect(self._preview.update_save_progress)
         self._pool.start(worker)
 
     def _on_apply_done(self, result: ApplyResult) -> None:
@@ -496,6 +497,7 @@ class MainWindow(QMainWindow):
         self._drop_label.setAcceptDrops(not busy)
 
     def _start_save_state(self) -> None:
+        self._preview.start_save_progress()
         self._apply_btn.setText("Saving…")
         self._apply_btn.setIcon(self._spinner_icon(self._spinner_angle))
         self._apply_btn.setEnabled(False)
@@ -506,6 +508,7 @@ class MainWindow(QMainWindow):
         self._apply_btn.setIcon(self._spinner_icon(self._spinner_angle))
 
     def _finish_save_state(self) -> None:
+        self._preview.finish_save_progress()
         self._save_spinner.stop()
         self._apply_btn.setText("Save thumbnail")
         if self._save_icon is not None:

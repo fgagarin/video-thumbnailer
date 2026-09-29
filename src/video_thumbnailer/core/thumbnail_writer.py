@@ -13,6 +13,7 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
+from typing import Callable
 
 import av
 import imageio_ffmpeg  # type: ignore[import-untyped]
@@ -44,6 +45,25 @@ _ALL_SUPPORTED = (
 _MP4_COVER_FORMAT_JPEG = 13
 
 
+class _SaveStages:
+    def __init__(self, callback: Callable[[str, float | None], None] | None) -> None:
+        self._callback = callback
+        self._name: str | None = None
+        self._started = 0.0
+
+    def start(self, name: str) -> None:
+        self.finish()
+        self._name = name
+        self._started = time.monotonic()
+        if self._callback is not None:
+            self._callback(name, None)
+
+    def finish(self) -> None:
+        if self._name is not None and self._callback is not None:
+            self._callback(self._name, time.monotonic() - self._started)
+        self._name = None
+
+
 class FormatDispatchThumbnailWriter:
     """Embed a thumbnail into a video file using the format-appropriate mechanism.
 
@@ -65,6 +85,7 @@ class FormatDispatchThumbnailWriter:
         thumbnail: Image.Image,
         *,
         position_ms: int | None = None,
+        on_progress: Callable[[str, float | None], None] | None = None,
     ) -> ApplyResult:
         """Embed ``thumbnail`` as cover art in ``video``.
 
@@ -99,6 +120,9 @@ class FormatDispatchThumbnailWriter:
                 ),
             )
 
+        stages = _SaveStages(on_progress)
+        stages.start("Preparing thumbnail")
+
         # Preserve the selected frame for zero-frame preview fallbacks.
         frame_buf = io.BytesIO()
         thumbnail.copy().convert("RGB").save(frame_buf, format="PNG")
@@ -114,6 +138,7 @@ class FormatDispatchThumbnailWriter:
 
         # FLV / WebM: no container embedding — return success immediately
         if video.format in _NO_EMBED_FORMATS:
+            stages.finish()
             elapsed_ms = int((time.monotonic() - start) * 1000)
             return ApplyResult(
                 success=True,
@@ -130,6 +155,7 @@ class FormatDispatchThumbnailWriter:
                     video.path,
                     jpeg_bytes,
                     frame_bytes,
+                    stages=stages,
                     position_ms=position_ms,
                     frame_number=(
                         round(position_ms / max(1, video.frame_step_ms))
@@ -139,9 +165,10 @@ class FormatDispatchThumbnailWriter:
                     write_mp4_covr=video.format is VideoFormat.MP4,
                 )
             elif video.format in _MKV_FORMATS:
-                self._embed_mkv_webm(video.path, jpeg_bytes)
+                self._embed_mkv_webm(video.path, jpeg_bytes, stages)
             elif video.format in _AVI_FORMATS:
-                self._remux_avi(video.path)
+                self._remux_avi(video.path, stages)
+                stages.finish()
                 elapsed_ms = int((time.monotonic() - start) * 1000)
                 return ApplyResult(
                     success=True,
@@ -152,12 +179,14 @@ class FormatDispatchThumbnailWriter:
                     ),
                 )
         except PermissionError as exc:
+            stages.finish()
             return ApplyResult(
                 success=False,
                 error_code=ApplyError.FILE_NOT_WRITABLE,
                 error_message=f"Permission denied writing '{video.path}': {exc}",
             )
         except subprocess.CalledProcessError as exc:
+            stages.finish()
             stderr = exc.stderr.decode(errors="replace") if exc.stderr else "(none)"
             return ApplyResult(
                 success=False,
@@ -167,6 +196,7 @@ class FormatDispatchThumbnailWriter:
                 ),
             )
         except OSError as exc:
+            stages.finish()
             if exc.errno == errno.ENOSPC:
                 return ApplyResult(
                     success=False,
@@ -182,12 +212,14 @@ class FormatDispatchThumbnailWriter:
                 error_message=f"Unexpected OS error: {exc}",
             )
         except Exception as exc:  # noqa: BLE001
+            stages.finish()
             return ApplyResult(
                 success=False,
                 error_code=ApplyError.UNEXPECTED,
                 error_message=f"Unexpected error: {exc}",
             )
 
+        stages.finish()
         elapsed_ms = int((time.monotonic() - start) * 1000)
         return ApplyResult(success=True, elapsed_ms=elapsed_ms)
 
@@ -201,6 +233,7 @@ class FormatDispatchThumbnailWriter:
         jpeg_bytes: bytes,
         frame_bytes: bytes,
         *,
+        stages: _SaveStages,
         position_ms: int | None,
         frame_number: int | None,
         write_mp4_covr: bool,
@@ -209,9 +242,11 @@ class FormatDispatchThumbnailWriter:
         ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
         video_dir = os.path.dirname(os.path.abspath(video_path))
         video_ext = os.path.splitext(video_path)[1].lower() or ".mp4"
+        stages.start("Inspecting video streams")
         concat_params = (
             self._h264_concat_params(video_path) if video_ext == ".mp4" else None
         )
+        stages.start("Preparing temporary files")
         cover_fd, cover_path = tempfile.mkstemp(
             dir=video_dir, prefix=".vt_cover_", suffix=".jpg"
         )
@@ -243,14 +278,18 @@ class FormatDispatchThumbnailWriter:
                     concat_path,
                     output_format,
                     concat_params,
+                    stages,
                 ):
                     if write_mp4_covr:
+                        stages.start("Writing cover art")
                         self._write_mp4_covr_tag(tmp_video_path, jpeg_bytes)
+                    stages.start("Writing frame metadata")
                     self._write_source_metadata(
                         tmp_video_path, frame_number, position_ms
                     )
                     return
 
+                stages.start("Encoding video")
                 subprocess.run(
                     [
                         ffmpeg_exe, "-y",
@@ -282,12 +321,15 @@ class FormatDispatchThumbnailWriter:
                     creationflags=_FFMPEG_CREATION_FLAGS,
                 )
                 if write_mp4_covr:
+                    stages.start("Writing cover art")
                     self._write_mp4_covr_tag(tmp_video_path, jpeg_bytes)
+                stages.start("Writing frame metadata")
                 self._write_source_metadata(
                     tmp_video_path, frame_number, position_ms
                 )
 
             atomic_replace(video_path, _ffmpeg_write_fn, copy_existing=False)
+            stages.start("Cleaning up temporary files")
         finally:
             for temp_path in (cover_path, frame_path, preview_path, concat_path):
                 try:
@@ -359,12 +401,14 @@ class FormatDispatchThumbnailWriter:
         concat_path: str,
         output_format: str,
         params: tuple[int, int, str, str, float],
+        stages: _SaveStages,
     ) -> bool:
         """Prepend one H.264 frame and stream-copy the original video packets."""
         ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
         width, height, profile, frame_rate, frame_duration = params
         duration_text = f"{frame_duration:.12g}"
 
+        stages.start("Encoding preview frame")
         subprocess.run(
             [
                 ffmpeg_exe, "-y",
@@ -382,6 +426,7 @@ class FormatDispatchThumbnailWriter:
             capture_output=True,
             creationflags=_FFMPEG_CREATION_FLAGS,
         )
+        stages.start("Checking encoded frame")
         with av.open(preview_path) as preview:
             preview_stream = preview.streams.video[0]
             preview_codec = preview_stream.codec_context
@@ -403,6 +448,7 @@ class FormatDispatchThumbnailWriter:
             f"file {self._concat_quote(video_path)}\n"
         )
         Path(concat_path).write_text(manifest, encoding="utf-8")
+        stages.start("Copying video streams")
         subprocess.run(
             [
                 ffmpeg_exe, "-y",
@@ -442,8 +488,11 @@ class FormatDispatchThumbnailWriter:
         if frame_number is not None and position_ms is not None:
             write_thumbnail_source(video_path, frame_number, position_ms)
 
-    def _embed_mkv_webm(self, video_path: str, jpeg_bytes: bytes) -> None:
+    def _embed_mkv_webm(
+        self, video_path: str, jpeg_bytes: bytes, stages: _SaveStages
+    ) -> None:
         """Embed cover art into an MKV or WebM file using ffmpeg -attach."""
+        stages.start("Preparing temporary files")
         ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
         video_dir = os.path.dirname(os.path.abspath(video_path))
         video_ext = os.path.splitext(video_path)[1].lower() or ".mkv"
@@ -461,6 +510,7 @@ class FormatDispatchThumbnailWriter:
                 )
                 os.close(out_fd)
                 try:
+                    stages.start("Attaching cover art")
                     subprocess.run(
                         [
                             ffmpeg_exe, "-y",
@@ -484,14 +534,16 @@ class FormatDispatchThumbnailWriter:
                     raise
 
             atomic_replace(video_path, _mkv_write_fn)
+            stages.start("Cleaning up temporary files")
         finally:
             try:
                 os.unlink(cover_path)
             except FileNotFoundError:
                 pass
 
-    def _remux_avi(self, video_path: str) -> None:
+    def _remux_avi(self, video_path: str, stages: _SaveStages) -> None:
         """Re-mux an AVI file in-place (no cover art; preserves all streams)."""
+        stages.start("Preparing temporary files")
         ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
         video_dir = os.path.dirname(os.path.abspath(video_path))
 
@@ -501,6 +553,7 @@ class FormatDispatchThumbnailWriter:
             )
             os.close(out_fd)
             try:
+                stages.start("Remuxing video")
                 subprocess.run(
                     [
                         ffmpeg_exe, "-y",

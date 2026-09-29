@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING
 
 from PIL import Image
@@ -95,6 +96,7 @@ class FrameExtractWorker(QRunnable):
 class _ApplySignals(QObject):
     finished: Signal = Signal(object)  # ApplyResult
     error: Signal = Signal(str)
+    progress: Signal = Signal(str, object)  # stage name, seconds or None
 
 
 class ApplyWorker(QRunnable):
@@ -129,9 +131,15 @@ class ApplyWorker(QRunnable):
                 self._video,
                 self._thumbnail,
                 position_ms=self._position_ms,
+                on_progress=self.signals.progress.emit,
             )
             if result.success:
+                started = time.monotonic()
+                self.signals.progress.emit("Refreshing thumbnail cache", None)
                 self._invalidator.invalidate(self._video)
+                self.signals.progress.emit(
+                    "Refreshing thumbnail cache", time.monotonic() - started
+                )
             self.signals.finished.emit(result)
         except Exception as exc:  # noqa: BLE001
             self.signals.error.emit(str(exc))

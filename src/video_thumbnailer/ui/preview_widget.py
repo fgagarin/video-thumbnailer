@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QSize, Qt
+from PySide6.QtCore import QSize, Qt, QTimer, Slot
 from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QPlainTextEdit,
     QPushButton,
     QSizePolicy,
     QVBoxLayout,
@@ -67,6 +69,22 @@ class PreviewWidget(QWidget):
         self._current_panel, self._current_title, self._current_label = (
             self._make_panel("Thumbnail")
         )
+        self._save_progress = QPlainTextEdit()
+        self._save_progress.setReadOnly(True)
+        self._save_progress.setFrameShape(QFrame.Shape.NoFrame)
+        self._save_progress.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored
+        )
+        self._save_progress.hide()
+        current_layout = self._current_panel.layout()
+        assert isinstance(current_layout, QVBoxLayout)
+        current_layout.addWidget(self._save_progress, 1)
+        self._save_stages: list[tuple[str, float]] = []
+        self._active_stage: str | None = None
+        self._stage_started = 0.0
+        self._progress_timer = QTimer(self)
+        self._progress_timer.setInterval(200)
+        self._progress_timer.timeout.connect(self._refresh_save_progress)
         thumbnail_layout.addWidget(self._current_panel, 1)
         self.apply_button = QPushButton("Save thumbnail")
         self.apply_button.setIcon(self._white_save_icon())
@@ -129,12 +147,47 @@ class PreviewWidget(QWidget):
 
     def clear(self) -> None:
         """Reset both panels to their placeholder states."""
+        self.finish_save_progress()
         self._current_pixmap = None
         self._candidate_pixmap = None
         self._show_placeholder(self._current_label, _NO_THUMBNAIL_HINT)
         self._show_placeholder(self._candidate_label, "No frame selected")
         self._candidate_title.setText("Frame")
         self._current_title.setText("Thumbnail")
+
+    def start_save_progress(self) -> None:
+        self._save_stages = []
+        self._active_stage = None
+        self._save_progress.clear()
+        self._current_label.hide()
+        self._save_progress.show()
+        self._progress_timer.start()
+
+    @Slot(str, object)
+    def update_save_progress(self, name: str, elapsed: float | None) -> None:
+        if elapsed is None:
+            self._active_stage = name
+            self._stage_started = time.monotonic()
+        else:
+            self._save_stages.append((name, elapsed))
+            self._active_stage = None
+        self._refresh_save_progress(scroll_to_end=True)
+
+    def finish_save_progress(self) -> None:
+        self._progress_timer.stop()
+        self._active_stage = None
+        self._save_progress.hide()
+        self._current_label.show()
+
+    def _refresh_save_progress(self, *, scroll_to_end: bool = False) -> None:
+        lines = [f"{name}: {elapsed:.1f} s" for name, elapsed in self._save_stages]
+        if self._active_stage is not None:
+            elapsed = time.monotonic() - self._stage_started
+            lines.append(f"> {self._active_stage}: {elapsed:.1f} s (running)")
+        scrollbar = self._save_progress.verticalScrollBar()
+        scroll_position = scrollbar.value()
+        self._save_progress.setPlainText("\n".join(lines))
+        scrollbar.setValue(scrollbar.maximum() if scroll_to_end else scroll_position)
 
     def sizeHint(self) -> QSize:
         return QSize(720, 220)

@@ -23,6 +23,30 @@ def pil_image() -> Image.Image:
 
 
 class TestPreviewWidget:
+    def test_save_progress_shows_live_time_and_restores_thumbnail(
+        self, preview: PreviewWidget
+    ) -> None:
+        preview.start_save_progress()
+        preview.update_save_progress("Encoding video", None)
+        preview._stage_started -= 2.0
+        preview._refresh_save_progress()
+
+        assert preview._save_progress.isVisible()
+        assert not preview._current_label.isVisible()
+        assert "Encoding video: 2." in preview._save_progress.toPlainText()
+        assert "(running)" in preview._save_progress.toPlainText()
+        assert preview._progress_timer.isActive()
+
+        preview.update_save_progress("Encoding video", 3.5)
+        preview.update_save_progress("Writing cover art", None)
+        assert "Encoding video: 3.5 s" in preview._save_progress.toPlainText()
+        assert "Writing cover art" in preview._save_progress.toPlainText()
+
+        preview.finish_save_progress()
+        assert not preview._save_progress.isVisible()
+        assert preview._current_label.isVisible()
+        assert not preview._progress_timer.isActive()
+
     def test_both_panels_visible_after_construction(self, preview: PreviewWidget) -> None:
         assert preview.isVisible()
         # Both internal labels should exist

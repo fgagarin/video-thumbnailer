@@ -80,6 +80,28 @@ class TestThumbnailWriter:
         assert result.success is True
         assert result.elapsed_ms >= 0
 
+    def test_write_reports_timed_stages(
+        self,
+        loader: PyAVVideoLoader,
+        writer: FormatDispatchThumbnailWriter,
+        sample_video: Path,
+        sample_pil_image: Image.Image,
+    ) -> None:
+        events: list[tuple[str, float | None]] = []
+
+        result = writer.write(
+            loader.load(str(sample_video)), sample_pil_image,
+            on_progress=lambda name, elapsed: events.append((name, elapsed)),
+        )
+
+        assert result.success
+        started = [name for name, elapsed in events if elapsed is None]
+        completed = [name for name, elapsed in events if elapsed is not None]
+        assert started == completed
+        assert started[0] == "Preparing thumbnail"
+        assert "Encoding preview frame" in started or "Encoding video" in started
+        assert all(elapsed >= 0 for _, elapsed in events if elapsed is not None)
+
     def test_write_mp4_runs_ffmpeg_without_console(
         self,
         loader: PyAVVideoLoader,

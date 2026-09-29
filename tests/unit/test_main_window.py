@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from threading import Event
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -428,6 +429,50 @@ class TestMainWindowApplyThumbnail:
         assert not window._apply_btn.isEnabled()
         assert window._save_spinner.isActive()
         window._finish_save_state()
+
+    def test_apply_progress_is_shown_and_cleared(self, window: MainWindow) -> None:
+        window._on_video_loaded(_make_vf())
+        window._current_frame = Image.new("RGB", (32, 32))
+
+        with patch.object(window._pool, "start") as start:
+            window._on_apply_clicked()
+
+        worker = start.call_args.args[0]
+        worker.signals.progress.emit("Encoding video", None)
+        assert "Encoding video" in window._preview._save_progress.toPlainText()
+        assert window._preview._save_progress.isVisible()
+
+        worker.signals.finished.emit(ApplyResult(success=True))
+        assert not window._preview._save_progress.isVisible()
+        assert window._preview._current_label.isVisible()
+
+    def test_apply_progress_arrives_while_worker_is_running(
+        self, window: MainWindow, qtbot
+    ) -> None:
+        window._on_video_loaded(_make_vf())
+        window._current_frame = Image.new("RGB", (32, 32))
+        release = Event()
+
+        def save(*args, on_progress, **kwargs):
+            on_progress("Encoding video", None)
+            release.wait(5)
+            on_progress("Encoding video", 2.0)
+            return ApplyResult(success=True)
+
+        window._writer.write.side_effect = save
+        try:
+            window._on_apply_clicked()
+            qtbot.waitUntil(
+                lambda: "(running)" in window._preview._save_progress.toPlainText(),
+                timeout=2000,
+            )
+            assert window._preview._save_progress.isVisible()
+        finally:
+            release.set()
+            qtbot.waitUntil(
+                lambda: not window._preview._save_progress.isVisible(),
+                timeout=3000,
+            )
 
     def test_apply_error_restores_button_and_shows_error(self, window: MainWindow) -> None:
         window._on_video_loaded(_make_vf())

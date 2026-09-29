@@ -113,6 +113,20 @@ class TestFrameExtractWorker:
 # ---------------------------------------------------------------------------
 
 class TestApplyWorker:
+    def test_run_emits_save_and_cache_progress(self) -> None:
+        writer = MagicMock(spec=FormatDispatchThumbnailWriter)
+        writer.write.return_value = ApplyResult(success=True)
+        invalidator = MagicMock()
+        worker = ApplyWorker(writer, invalidator, _make_vf(), Image.new("RGB", (10, 10)))
+        events = []
+        worker.signals.progress.connect(lambda name, elapsed: events.append((name, elapsed)))
+
+        _run_worker(worker)
+
+        assert events[0] == ("Refreshing thumbnail cache", None)
+        assert events[1][0] == "Refreshing thumbnail cache"
+        assert events[1][1] >= 0
+
     def test_run_success_calls_invalidator(self) -> None:
         writer = MagicMock(spec=FormatDispatchThumbnailWriter)
         writer.write.return_value = ApplyResult(success=True)
@@ -138,7 +152,10 @@ class TestApplyWorker:
         worker = ApplyWorker(writer, invalidator, vf, thumbnail, position_ms=1680)
         _run_worker(worker)
 
-        writer.write.assert_called_once_with(vf, thumbnail, position_ms=1680)
+        writer.write.assert_called_once_with(
+            vf, thumbnail, position_ms=1680,
+            on_progress=worker.signals.progress.emit,
+        )
 
     def test_run_failure_result_skips_invalidator(self) -> None:
         writer = MagicMock(spec=FormatDispatchThumbnailWriter)
