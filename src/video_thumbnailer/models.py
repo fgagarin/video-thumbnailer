@@ -136,12 +136,16 @@ class ApplyResult:
         error_code: Machine-readable failure reason; None on success.
         error_message: Human-readable failure description; None on success.
         elapsed_ms: Total wall-clock duration of the operation in milliseconds.
+        duration_shift_ms: Milliseconds by which every original frame's timeline
+            position moved forward (the concat fast path prepends a new frame,
+            growing the file's duration by this much); 0 when not applicable.
     """
 
     success: bool
     error_code: ApplyError | None = None
     error_message: str | None = None
     elapsed_ms: int = 0
+    duration_shift_ms: int = 0
 
 
 @dataclass

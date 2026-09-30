@@ -455,26 +455,41 @@ class MainWindow(QMainWindow):
             # Update the cached existing_thumbnail so subsequent confirmation dialogs
             # reflect reality and the Linux XDG writer has the right image.
             if self._video is not None and self._current_frame is not None:
+                # The concat fast path prepends a frame, pushing every original
+                # frame (and the current timeline position) forward in time.
+                shift_ms = result.duration_shift_ms
+                new_duration_ms = self._video.duration_ms + shift_ms
+                new_position_ms = (
+                    min(
+                        new_duration_ms,
+                        self._current_frame_position_ms + shift_ms,
+                    )
+                    if self._current_frame_position_ms is not None
+                    else None
+                )
                 self._video = VideoFile(
                     path=self._video.path,
                     format=self._video.format,
-                    duration_ms=self._video.duration_ms,
+                    duration_ms=new_duration_ms,
                     width=self._video.width,
                     height=self._video.height,
                     existing_thumbnail=self._current_frame,
                     is_writable=self._video.is_writable,
                     frame_step_ms=self._video.frame_step_ms,
                     thumbnail_frame_number=(
-                        round(
-                            self._current_frame_position_ms
-                            / max(1, self._video.frame_step_ms)
-                        )
-                        if self._current_frame_position_ms is not None
+                        round(new_position_ms / max(1, self._video.frame_step_ms))
+                        if new_position_ms is not None
                         else self._video.thumbnail_frame_number
                     ),
-                    thumbnail_position_ms=self._current_frame_position_ms,
+                    thumbnail_position_ms=new_position_ms,
                 )
+                self._current_frame_position_ms = new_position_ms
                 self._preview.set_current_thumbnail(self._current_frame)
+                if shift_ms:
+                    self._timeline.set_duration(new_duration_ms)
+                    self._timeline.set_position(new_position_ms or 0)
+                    self._filmstrip.set_video(self._video, self._extractor)
+                    self._on_scrub(new_position_ms or 0)
         else:
             QMessageBox.critical(
                 self,

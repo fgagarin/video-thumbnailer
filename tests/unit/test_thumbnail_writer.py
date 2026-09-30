@@ -155,8 +155,15 @@ class TestThumbnailWriter:
 
         assert result.success is True
         reopened = loader.load(str(sample_video))
-        assert reopened.thumbnail_position_ms == 1680
-        assert reopened.thumbnail_frame_number == 42
+        # The concat fast path prepends a frame, shifting every original frame
+        # (including the one selected) forward by duration_shift_ms. Use the
+        # pre-write frame_step_ms: reopening can recompute a slightly different
+        # average frame rate once an extra frame has been prepended.
+        expected_position_ms = 1680 + result.duration_shift_ms
+        assert reopened.thumbnail_position_ms == expected_position_ms
+        assert reopened.thumbnail_frame_number == round(
+            expected_position_ms / video.frame_step_ms
+        )
 
     def test_write_mp4_sets_selected_frame_as_first_video_frame(
         self,

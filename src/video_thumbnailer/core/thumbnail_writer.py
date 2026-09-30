@@ -149,9 +149,10 @@ class FormatDispatchThumbnailWriter:
                 ),
             )
 
+        duration_shift_ms = 0
         try:
             if video.format in _MP4_MOV_FORMATS:
-                self._embed_mp4_mov(
+                duration_shift_ms = self._embed_mp4_mov(
                     video.path,
                     jpeg_bytes,
                     frame_bytes,
@@ -162,6 +163,7 @@ class FormatDispatchThumbnailWriter:
                         if position_ms is not None
                         else None
                     ),
+                    frame_step_ms=video.frame_step_ms,
                     write_mp4_covr=video.format is VideoFormat.MP4,
                 )
             elif video.format in _MKV_FORMATS:
@@ -221,7 +223,9 @@ class FormatDispatchThumbnailWriter:
 
         stages.finish()
         elapsed_ms = int((time.monotonic() - start) * 1000)
-        return ApplyResult(success=True, elapsed_ms=elapsed_ms)
+        return ApplyResult(
+            success=True, elapsed_ms=elapsed_ms, duration_shift_ms=duration_shift_ms
+        )
 
     # ------------------------------------------------------------------
     # Format-specific embedding helpers
@@ -236,9 +240,16 @@ class FormatDispatchThumbnailWriter:
         stages: _SaveStages,
         position_ms: int | None,
         frame_number: int | None,
+        frame_step_ms: int,
         write_mp4_covr: bool,
-    ) -> None:
-        """Embed a preview and cover art into an MP4 or MOV file."""
+    ) -> int:
+        """Embed a preview and cover art into an MP4 or MOV file.
+
+        Returns:
+            Milliseconds the concat fast path shifted every original frame
+            forward by prepending a new frame; 0 when the full re-encode path
+            was used instead (frame positions are unchanged in that case).
+        """
         ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
         video_dir = os.path.dirname(os.path.abspath(video_path))
         video_ext = os.path.splitext(video_path)[1].lower() or ".mp4"
@@ -267,7 +278,10 @@ class FormatDispatchThumbnailWriter:
             with os.fdopen(frame_fd, "wb") as f:
                 f.write(frame_bytes)
 
+            shift_ms = 0
+
             def _ffmpeg_write_fn(tmp_video_path: Path) -> None:
+                nonlocal shift_ms
                 output_format = "mp4"
                 if concat_params is not None and self._write_h264_concat(
                     video_path,
@@ -280,12 +294,23 @@ class FormatDispatchThumbnailWriter:
                     concat_params,
                     stages,
                 ):
+                    # The concat path prepends a new frame, pushing every original
+                    # frame (and the one the user selected) forward in time.
+                    shift_ms = round(concat_params[4] * 1000)
+                    shifted_position_ms = (
+                        position_ms + shift_ms if position_ms is not None else None
+                    )
+                    shifted_frame_number = (
+                        round(shifted_position_ms / max(1, frame_step_ms))
+                        if shifted_position_ms is not None
+                        else frame_number
+                    )
                     if write_mp4_covr:
                         stages.start("Writing cover art")
                         self._write_mp4_covr_tag(tmp_video_path, jpeg_bytes)
                     stages.start("Writing frame metadata")
                     self._write_source_metadata(
-                        tmp_video_path, frame_number, position_ms
+                        tmp_video_path, shifted_frame_number, shifted_position_ms
                     )
                     return
 
@@ -336,6 +361,7 @@ class FormatDispatchThumbnailWriter:
                     os.unlink(temp_path)
                 except FileNotFoundError:
                     pass
+        return shift_ms
 
     @staticmethod
     def _h264_concat_params(video_path: str) -> tuple[int, int, str, str, float] | None:
