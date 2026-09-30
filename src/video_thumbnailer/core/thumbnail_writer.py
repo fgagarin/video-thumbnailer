@@ -363,8 +363,10 @@ class FormatDispatchThumbnailWriter:
                 "main": "main",
                 "high": "high",
             }
+            # average_rate need not equal base_rate: the concat demuxer's explicit
+            # segment duration (plus a matching -itsoffset) keeps A/V in sync
+            # independent of whether the source stream is CFR or VFR.
             frame_rate = stream.average_rate
-            base_rate = stream.base_rate
             if (
                 codec.name != "h264"
                 or profile not in profiles
@@ -374,7 +376,6 @@ class FormatDispatchThumbnailWriter:
                 or stream.height <= 0
                 or frame_rate is None
                 or float(frame_rate) <= 0
-                or (base_rate is not None and frame_rate != base_rate)
             ):
                 return None
 
