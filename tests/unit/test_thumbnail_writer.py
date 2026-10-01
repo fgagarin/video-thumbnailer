@@ -106,6 +106,7 @@ class TestThumbnailWriter:
                 "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
                 "-c:v", "libaom-av1", "-cpu-used", "8", "-row-mt", "1",
                 "-threads", "4", "-pix_fmt", "yuv420p", "-c:a", "aac",
+                "-video_track_timescale", "90000",
                 str(path),
             ],
             check=True, capture_output=True,
@@ -149,7 +150,12 @@ class TestThumbnailWriter:
         assert mean[0] > mean[1] + 80
         assert mean[0] > mean[2] + 80
         reopened = loader.load(str(path))
+        assert reopened.duration_ms == video.duration_ms + result.duration_shift_ms
+        assert reopened.frame_step_ms == video.frame_step_ms
         assert reopened.thumbnail_position_ms == 1040
+        assert reopened.thumbnail_frame_number == round(
+            reopened.thumbnail_position_ms / video.frame_step_ms
+        )
 
     def _first_playable_frame(self, video_path: Path) -> Image.Image:
         with av.open(str(video_path)) as container:

@@ -417,7 +417,7 @@ class FormatDispatchThumbnailWriter:
     @staticmethod
     def _concat_decision(
         video_path: str, *, replace_existing_preview: bool = False
-    ) -> tuple[tuple[str, int, int, str, str, float] | None, str | None]:
+    ) -> tuple[tuple[str, int, int, str, str, float, int] | None, str | None]:
         with av.open(video_path) as container:
             playable = [
                 stream
@@ -476,6 +476,9 @@ class FormatDispatchThumbnailWriter:
                 reasons.append(f"pixel format is {pix_fmt!r}, not yuv420p")
             if stream.width <= 0 or stream.height <= 0:
                 reasons.append(f"invalid dimensions {stream.width}x{stream.height}")
+            time_base = stream.time_base
+            if time_base is None or time_base.numerator != 1:
+                reasons.append(f"unsupported video time base {time_base!r}")
             if frame_rate is None or float(frame_rate) <= 0:
                 reasons.append(f"invalid frame rate {frame_rate!r}")
             if reasons:
@@ -487,6 +490,7 @@ class FormatDispatchThumbnailWriter:
                 return None, "; ".join(reasons) + "."
 
             assert frame_rate is not None
+            assert time_base is not None
             return (
                 (
                     "av1" if is_av1 else "h264",
@@ -495,6 +499,7 @@ class FormatDispatchThumbnailWriter:
                     "main" if is_av1 else h264_profiles[profile],
                     str(frame_rate),
                     1 / float(frame_rate),
+                    time_base.denominator,
                 ),
                 None,
             )
@@ -514,13 +519,21 @@ class FormatDispatchThumbnailWriter:
         concat_path: str,
         stripped_path: str,
         output_format: str,
-        params: tuple[str, int, int, str, str, float],
+        params: tuple[str, int, int, str, str, float, int],
         stages: _SaveStages,
         replace_existing_preview: bool,
     ) -> bool:
         """Prepend a matching frame, optionally replacing the existing preview."""
         ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-        codec_name, width, height, profile, frame_rate, frame_duration = params
+        (
+            codec_name,
+            width,
+            height,
+            profile,
+            frame_rate,
+            frame_duration,
+            video_track_timescale,
+        ) = params
         duration_text = f"{frame_duration:.12g}"
         encoder_args = (
             ["-c:v", "libaom-av1", "-cpu-used", "8", "-row-mt", "1",
@@ -539,6 +552,7 @@ class FormatDispatchThumbnailWriter:
                 "-vf", f"scale={width}:{height}:flags=lanczos",
                 "-an", "-sn",
                 *encoder_args,
+                "-video_track_timescale", str(video_track_timescale),
                 "-f", "mp4",
                 preview_path,
             ],
@@ -550,6 +564,7 @@ class FormatDispatchThumbnailWriter:
         with av.open(preview_path) as preview:
             preview_stream = preview.streams.video[0]
             preview_codec = preview_stream.codec_context
+            preview_time_base = preview_stream.time_base
             if (
                 (preview_codec.codec.id != _AV1_CODEC_ID if codec_name == "av1"
                  else preview_codec.name != "h264")
@@ -558,25 +573,26 @@ class FormatDispatchThumbnailWriter:
                 or preview_codec.format.name != "yuv420p"
                 or preview_stream.width != width
                 or preview_stream.height != height
-                or preview_stream.average_rate is None
-                or abs(float(preview_stream.average_rate) - 1 / frame_duration) > 0.001
+                or preview_time_base is None
+                or preview_time_base.numerator != 1
+                or preview_time_base.denominator != video_track_timescale
             ):
                 logger.debug(
                     "concat fast path skipped for '%s': encoded preview frame "
                     "did not match source params (codec=%s, profile=%s, "
-                    "pix_fmt=%s, size=%dx%d, rate=%s; expected profile=%s, "
-                    "size=%dx%d, rate=%s)",
+                    "pix_fmt=%s, size=%dx%d, time_base=%s; expected profile=%s, "
+                    "size=%dx%d, time_base=1/%d)",
                     video_path,
                     preview_codec.name,
                     preview_codec.profile,
                     preview_codec.format.name if preview_codec.format else None,
                     preview_stream.width,
                     preview_stream.height,
-                    preview_stream.average_rate,
+                    preview_time_base,
                     profile,
                     width,
                     height,
-                    1 / frame_duration,
+                    video_track_timescale,
                 )
                 return False
 
