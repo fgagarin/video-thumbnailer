@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
 from PIL import Image
 from PySide6.QtCore import QSize
+from PySide6.QtWidgets import QMessageBox
 
 from video_thumbnailer.ui.preview_widget import PreviewWidget
 
@@ -23,6 +26,21 @@ def pil_image() -> Image.Image:
 
 
 class TestPreviewWidget:
+    def test_reencode_warning_shows_reason_on_click(
+        self, preview: PreviewWidget
+    ) -> None:
+        button = preview.reencode_warning_button
+        assert not button.isVisible()
+
+        preview.set_reencode_reason("AV1 is not supported by fast copy.")
+        assert button.isVisible()
+        with patch.object(QMessageBox, "information") as information:
+            button.click()
+        assert "AV1" in information.call_args.args[2]
+
+        preview.clear()
+        assert not button.isVisible()
+
     def test_save_progress_shows_live_time_and_restores_thumbnail(
         self, preview: PreviewWidget
     ) -> None:
@@ -46,6 +64,18 @@ class TestPreviewWidget:
         assert not preview._save_progress.isVisible()
         assert preview._current_label.isVisible()
         assert not preview._progress_timer.isActive()
+
+    def test_set_last_save_duration_shows_and_hides_label(
+        self, preview: PreviewWidget
+    ) -> None:
+        assert not preview._save_duration_label.isVisible()
+
+        preview.set_last_save_duration(2.5)
+        assert preview._save_duration_label.isVisible()
+        assert "2.5" in preview._save_duration_label.text()
+
+        preview.set_last_save_duration(None)
+        assert not preview._save_duration_label.isVisible()
 
     def test_both_panels_visible_after_construction(self, preview: PreviewWidget) -> None:
         assert preview.isVisible()
@@ -98,7 +128,9 @@ class TestPreviewWidget:
         assert button.width() == 176
         assert button.sizePolicy().horizontalPolicy().name == "Fixed"
         assert "#0078d4" in button.styleSheet()
-        assert thumbnail_layout.indexOf(button) == thumbnail_layout.count() - 1
+        button_row = thumbnail_layout.itemAt(thumbnail_layout.count() - 1).layout()
+        assert button_row is not None
+        assert button_row.indexOf(button) == 0
         assert thumbnail_panel.geometry().bottom() < button.geometry().top()
         assert thumbnail_panel.geometry().x() == button.geometry().x()
 

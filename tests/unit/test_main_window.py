@@ -44,6 +44,7 @@ def deps():
     loader = MagicMock(spec=PyAVVideoLoader)
     extractor = MagicMock(spec=PyAVFrameExtractor)
     writer = MagicMock(spec=FormatDispatchThumbnailWriter)
+    writer.reencode_reason.return_value = None
     invalidator = MagicMock(spec=CacheInvalidator)
     return loader, extractor, writer, invalidator
 
@@ -85,6 +86,16 @@ class TestMainWindowConstruction:
         assert window.height() >= 700
 
 class TestMainWindowVideoLoading:
+    def test_reencode_warning_tracks_loaded_video(
+        self, window: MainWindow, deps
+    ) -> None:
+        deps[2].reencode_reason.return_value = "AV1 needs full re-encoding."
+        window._on_video_loaded(_make_vf())
+        assert window._preview.reencode_warning_button.isVisible()
+        deps[2].reencode_reason.return_value = None
+        window._on_video_loaded(_make_vf())
+        assert not window._preview.reencode_warning_button.isVisible()
+
     def test_on_video_loaded_updates_ui(self, window: MainWindow) -> None:
         vf = _make_vf()
         window._on_video_loaded(vf)
@@ -392,6 +403,21 @@ class TestMainWindowFrameExtraction:
 
 
 class TestMainWindowApplyThumbnail:
+    def test_warning_is_refreshed_after_save(
+        self, window: MainWindow
+    ) -> None:
+        window._on_video_loaded(_make_vf())
+        assert not window._preview.reencode_warning_button.isVisible()
+        window._current_frame = Image.new("RGB", (32, 32))
+        window._writer.reencode_reason.return_value = (
+            "An attached-picture video stream is already present."
+        )
+
+        window._on_apply_done(ApplyResult(success=True))
+
+        assert window._preview.reencode_warning_button.isVisible()
+        window._writer.reencode_reason.assert_called_with(window._video)
+
     def test_on_apply_done_success_is_silent_and_updates_thumbnail(
         self, window: MainWindow
     ) -> None:

@@ -11,9 +11,12 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QSizePolicy,
+    QStyle,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -104,11 +107,36 @@ class PreviewWidget(QWidget):
             "QPushButton:pressed { background: #005a9e; }"
             "QPushButton:disabled { background: #8ab9dc; border-color: #8ab9dc; }"
         )
-        thumbnail_layout.addWidget(
-            self.apply_button,
-            0,
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignBottom,
+        self._save_duration_label = QLabel()
+        self._save_duration_label.setStyleSheet("color: #666666; font-size: 12px;")
+        self._save_duration_label.hide()
+
+        button_row = QHBoxLayout()
+        button_row.setContentsMargins(0, 0, 0, 0)
+        button_row.setSpacing(8)
+        button_row.addWidget(
+            self.apply_button, 0, Qt.AlignmentFlag.AlignBottom
         )
+        self.reencode_warning_button = QToolButton()
+        self.reencode_warning_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxWarning)
+        )
+        self.reencode_warning_button.setIconSize(QSize(20, 20))
+        self.reencode_warning_button.setFixedSize(34, 34)
+        self.reencode_warning_button.setAutoRaise(True)
+        self.reencode_warning_button.setToolTip("Why will this video be re-encoded?")
+        self.reencode_warning_button.setAccessibleName("Video re-encoding warning")
+        self.reencode_warning_button.clicked.connect(self._show_reencode_reason)
+        self.reencode_warning_button.hide()
+        self._reencode_reason: str | None = None
+        button_row.addWidget(
+            self.reencode_warning_button, 0, Qt.AlignmentFlag.AlignBottom
+        )
+        button_row.addWidget(
+            self._save_duration_label, 0, Qt.AlignmentFlag.AlignBottom
+        )
+        button_row.addStretch(1)
+        thumbnail_layout.addLayout(button_row)
         layout.addWidget(self._thumbnail_column, 1)
         self._current_pixmap: QPixmap | None = None
         self._candidate_pixmap: QPixmap | None = None
@@ -148,17 +176,47 @@ class PreviewWidget(QWidget):
     def clear(self) -> None:
         """Reset both panels to their placeholder states."""
         self.finish_save_progress()
+        self.set_reencode_reason(None)
         self._current_pixmap = None
         self._candidate_pixmap = None
         self._show_placeholder(self._current_label, _NO_THUMBNAIL_HINT)
         self._show_placeholder(self._candidate_label, "No frame selected")
         self._candidate_title.setText("Frame")
         self._current_title.setText("Thumbnail")
+        self._save_duration_label.hide()
+
+    def set_last_save_duration(self, seconds: float | None) -> None:
+        """Show the elapsed time of the most recent save next to the button.
+
+        Args:
+            seconds: Wall-clock duration of the save; hides the label if None.
+        """
+        if seconds is None:
+            self._save_duration_label.hide()
+            return
+        self._save_duration_label.setText(f"Saved in {seconds:.1f}s")
+        self._save_duration_label.show()
+
+    def set_reencode_reason(self, reason: str | None) -> None:
+        """Show the warning only when saving will require a full re-encode."""
+        self._reencode_reason = reason
+        self.reencode_warning_button.setVisible(reason is not None)
+
+    def _show_reencode_reason(self) -> None:
+        if self._reencode_reason is not None:
+            QMessageBox.information(
+                self,
+                "Video re-encoding",
+                "Saving this thumbnail will re-encode the video, which can take "
+                "longer and change its video codec.\n\n"
+                f"Reason: {self._reencode_reason}",
+            )
 
     def start_save_progress(self) -> None:
         self._save_stages = []
         self._active_stage = None
         self._save_progress.clear()
+        self._save_duration_label.hide()
         self._current_label.hide()
         self._save_progress.show()
         self._progress_timer.start()

@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import subprocess
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import av
 import pytest
@@ -56,6 +56,101 @@ def _make_flv_video_file(path: Path) -> VideoFile:
 
 
 class TestThumbnailWriter:
+    def test_reencode_reason_uses_concat_eligibility(
+        self,
+        loader: PyAVVideoLoader,
+        writer: FormatDispatchThumbnailWriter,
+        sample_video: Path,
+    ) -> None:
+        video = loader.load(str(sample_video))
+        assert writer.reencode_reason(video) is None
+
+        with av.open(str(sample_video)) as container:
+            disposition = container.streams.video[0].disposition
+        stream = MagicMock()
+        stream.disposition = disposition
+        stream.codec_context.name = "vp9"
+        stream.codec_context.codec.id = av.Codec("vp9", "r").id
+        stream.codec_context.codec.long_name = "Google VP9"
+        stream.codec_context.profile = "Main"
+        stream.codec_context.format.name = "yuv420p"
+        stream.width = 1920
+        stream.height = 1080
+        stream.average_rate = 60
+        mocked_container = MagicMock()
+        mocked_container.streams.video = [stream]
+        mocked_container.__enter__.return_value = mocked_container
+        with patch(
+            "video_thumbnailer.core.thumbnail_writer.av.open",
+            return_value=mocked_container,
+        ):
+            reason = writer.reencode_reason(video)
+
+        assert reason is not None
+        assert "VP9" in reason
+        assert "H.264" in reason
+
+    def test_av1_mp4_prepends_frame_without_reencoding_source(
+        self,
+        tmp_path: Path,
+        loader: PyAVVideoLoader,
+        writer: FormatDispatchThumbnailWriter,
+    ) -> None:
+        import imageio_ffmpeg
+
+        path = tmp_path / "sample_av1.mp4"
+        subprocess.run(
+            [
+                imageio_ffmpeg.get_ffmpeg_exe(), "-y",
+                "-f", "lavfi", "-i", "testsrc=size=320x240:rate=25:duration=3",
+                "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+                "-c:v", "libaom-av1", "-cpu-used", "8", "-row-mt", "1",
+                "-threads", "4", "-pix_fmt", "yuv420p", "-c:a", "aac",
+                str(path),
+            ],
+            check=True, capture_output=True,
+        )
+        video = loader.load(str(path))
+        assert writer.reencode_reason(video) is None
+        source_first_mean = ImageStat.Stat(self._first_playable_frame(path)).mean
+        with av.open(str(path)) as source:
+            source_packets = [
+                bytes(packet) for packet in source.demux(video=0) if packet.size
+            ]
+
+        stages: list[str] = []
+        selected = Image.new("RGB", (320, 240), (240, 20, 20))
+        result = writer.write(
+            video, selected, position_ms=1000,
+            on_progress=lambda name, elapsed: stages.append(name) if elapsed is None else None,
+        )
+
+        assert result.success, result.error_message
+        assert result.duration_shift_ms == 40
+        assert "Copying video streams" in stages
+        assert "Encoding video" not in stages
+        with av.open(str(path)) as output:
+            assert output.streams.video[0].codec_context.codec.id == av.Codec("av1", "r").id
+            output_packets = [
+                bytes(packet) for packet in output.demux(video=0) if packet.size
+            ]
+        assert output_packets[1:] == source_packets
+        with av.open(str(path)) as output:
+            frames = list(output.decode(output.streams.video[0]))
+            assert len(frames) == 76
+            assert output.streams.audio[0].codec_context.name == "aac"
+        first_original_mean = ImageStat.Stat(frames[1].to_image().convert("RGB")).mean
+        assert all(
+            abs(before - after) < 5
+            for before, after in zip(source_first_mean, first_original_mean)
+        )
+        first_frame = self._first_playable_frame(path)
+        mean = ImageStat.Stat(first_frame).mean
+        assert mean[0] > mean[1] + 80
+        assert mean[0] > mean[2] + 80
+        reopened = loader.load(str(path))
+        assert reopened.thumbnail_position_ms == 1040
+
     def _first_playable_frame(self, video_path: Path) -> Image.Image:
         with av.open(str(video_path)) as container:
             playable = [

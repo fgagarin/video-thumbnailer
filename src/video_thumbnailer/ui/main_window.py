@@ -320,6 +320,7 @@ class MainWindow(QMainWindow):
         self._path_container.show()
         self._filmstrip.set_video(video, self._extractor)
         self._preview.clear()
+        self._preview.set_reencode_reason(self._writer.reencode_reason(video))
         self._preview.set_current_thumbnail(video.existing_thumbnail)
         self._preview.show()
         self._filmstrip.show()
@@ -452,6 +453,7 @@ class MainWindow(QMainWindow):
         self._finish_save_state()
 
         if result.success:
+            self._preview.set_last_save_duration(result.elapsed_ms / 1000)
             # Update the cached existing_thumbnail so subsequent confirmation dialogs
             # reflect reality and the Linux XDG writer has the right image.
             if self._video is not None and self._current_frame is not None:
@@ -485,12 +487,16 @@ class MainWindow(QMainWindow):
                 )
                 self._current_frame_position_ms = new_position_ms
                 self._preview.set_current_thumbnail(self._current_frame)
+                self._preview.set_reencode_reason(
+                    self._writer.reencode_reason(self._video)
+                )
                 if shift_ms:
                     self._timeline.set_duration(new_duration_ms)
                     self._timeline.set_position(new_position_ms or 0)
                     self._filmstrip.set_video(self._video, self._extractor)
                     self._on_scrub(new_position_ms or 0)
         else:
+            self._preview.set_last_save_duration(None)
             QMessageBox.critical(
                 self,
                 "Apply Failed",
@@ -500,6 +506,7 @@ class MainWindow(QMainWindow):
     def _on_apply_error(self, message: str) -> None:
         self._set_busy(False)
         self._finish_save_state()
+        self._preview.set_last_save_duration(None)
         QMessageBox.critical(self, "Apply Error", message)
 
     # ------------------------------------------------------------------

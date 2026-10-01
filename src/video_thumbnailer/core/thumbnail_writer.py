@@ -43,6 +43,7 @@ _ALL_SUPPORTED = (
 )
 
 _MP4_COVER_FORMAT_JPEG = 13
+_AV1_CODEC_ID = av.Codec("av1", "r").id
 
 
 class _SaveStages:
@@ -231,6 +232,15 @@ class FormatDispatchThumbnailWriter:
     # Format-specific embedding helpers
     # ------------------------------------------------------------------
 
+    def reencode_reason(self, video: VideoFile) -> str | None:
+        """Return the known reason MP4/MOV saving will re-encode the video."""
+        if video.format not in _MP4_MOV_FORMATS:
+            return None
+        if Path(video.path).suffix.lower() != ".mp4":
+            return "The fast copy path supports .mp4 files only."
+        _, reason = self._concat_decision(video.path)
+        return reason
+
     def _embed_mp4_mov(
         self,
         video_path: str,
@@ -254,9 +264,15 @@ class FormatDispatchThumbnailWriter:
         video_dir = os.path.dirname(os.path.abspath(video_path))
         video_ext = os.path.splitext(video_path)[1].lower() or ".mp4"
         stages.start("Inspecting video streams")
-        concat_params = (
-            self._h264_concat_params(video_path) if video_ext == ".mp4" else None
-        )
+        if video_ext == ".mp4":
+            concat_params, _ = self._concat_decision(video_path)
+        else:
+            logger.debug(
+                "concat fast path skipped for '%s': extension %r is not .mp4",
+                video_path,
+                video_ext,
+            )
+            concat_params = None
         stages.start("Preparing temporary files")
         cover_fd, cover_path = tempfile.mkstemp(
             dir=video_dir, prefix=".vt_cover_", suffix=".jpg"
@@ -283,7 +299,7 @@ class FormatDispatchThumbnailWriter:
             def _ffmpeg_write_fn(tmp_video_path: Path) -> None:
                 nonlocal shift_ms
                 output_format = "mp4"
-                if concat_params is not None and self._write_h264_concat(
+                if concat_params is not None and self._write_concat(
                     video_path,
                     tmp_video_path,
                     frame_path,
@@ -296,7 +312,7 @@ class FormatDispatchThumbnailWriter:
                 ):
                     # The concat path prepends a new frame, pushing every original
                     # frame (and the one the user selected) forward in time.
-                    shift_ms = round(concat_params[4] * 1000)
+                    shift_ms = round(concat_params[5] * 1000)
                     shifted_position_ms = (
                         position_ms + shift_ms if position_ms is not None else None
                     )
@@ -314,6 +330,10 @@ class FormatDispatchThumbnailWriter:
                     )
                     return
 
+                logger.info(
+                    "Full re-encode required for '%s' (concat fast path unavailable)",
+                    video_path,
+                )
                 stages.start("Encoding video")
                 subprocess.run(
                     [
@@ -364,8 +384,9 @@ class FormatDispatchThumbnailWriter:
         return shift_ms
 
     @staticmethod
-    def _h264_concat_params(video_path: str) -> tuple[int, int, str, str, float] | None:
-        """Return safe-to-probe parameters for the supported H.264 concat path."""
+    def _concat_decision(
+        video_path: str,
+    ) -> tuple[tuple[str, int, int, str, str, float] | None, str | None]:
         with av.open(video_path) as container:
             playable = [
                 stream
@@ -373,44 +394,77 @@ class FormatDispatchThumbnailWriter:
                 if not bool(stream.disposition & stream.disposition.attached_pic)
             ]
             if len(playable) != 1:
-                return None
+                logger.debug(
+                    "concat fast path skipped for '%s': found %d playable video "
+                    "stream(s), expected exactly 1",
+                    video_path,
+                    len(playable),
+                )
+                return (
+                    None,
+                    f"Expected one playable video stream; found {len(playable)}.",
+                )
             if any(
                 bool(stream.disposition & stream.disposition.attached_pic)
                 for stream in container.streams.video
             ):
-                return None
+                logger.debug(
+                    "concat fast path skipped for '%s': file already has an "
+                    "attached-picture video stream",
+                    video_path,
+                )
+                return None, "An attached-picture video stream is already present."
 
             stream = playable[0]
             codec = stream.codec_context
             profile = (codec.profile or "").lower()
-            profiles = {
+            h264_profiles = {
                 "baseline": "baseline",
                 "constrained baseline": "baseline",
                 "main": "main",
                 "high": "high",
             }
+            is_av1 = codec.codec.id == _AV1_CODEC_ID
             # average_rate need not equal base_rate: the concat demuxer's explicit
             # segment duration (plus a matching -itsoffset) keeps A/V in sync
             # independent of whether the source stream is CFR or VFR.
             frame_rate = stream.average_rate
-            if (
-                codec.name != "h264"
-                or profile not in profiles
-                or codec.format is None
-                or codec.format.name != "yuv420p"
-                or stream.width <= 0
-                or stream.height <= 0
-                or frame_rate is None
-                or float(frame_rate) <= 0
+            reasons: list[str] = []
+            if codec.name != "h264" and not is_av1:
+                reasons.append(
+                    f"video codec is {codec.codec.long_name or codec.name} "
+                    "(fast copy supports H.264 and AV1 only)"
+                )
+            if (is_av1 and profile != "main") or (
+                not is_av1 and profile not in h264_profiles
             ):
-                return None
+                reasons.append(f"profile is {(codec.profile or '(none)')!r}")
+            if codec.format is None or codec.format.name != "yuv420p":
+                pix_fmt = codec.format.name if codec.format is not None else None
+                reasons.append(f"pixel format is {pix_fmt!r}, not yuv420p")
+            if stream.width <= 0 or stream.height <= 0:
+                reasons.append(f"invalid dimensions {stream.width}x{stream.height}")
+            if frame_rate is None or float(frame_rate) <= 0:
+                reasons.append(f"invalid frame rate {frame_rate!r}")
+            if reasons:
+                logger.debug(
+                    "concat fast path skipped for '%s': %s",
+                    video_path,
+                    "; ".join(reasons),
+                )
+                return None, "; ".join(reasons) + "."
 
+            assert frame_rate is not None
             return (
-                stream.width,
-                stream.height,
-                profiles[profile],
-                str(frame_rate),
-                1 / float(frame_rate),
+                (
+                    "av1" if is_av1 else "h264",
+                    stream.width,
+                    stream.height,
+                    "main" if is_av1 else h264_profiles[profile],
+                    str(frame_rate),
+                    1 / float(frame_rate),
+                ),
+                None,
             )
 
     @staticmethod
@@ -418,7 +472,7 @@ class FormatDispatchThumbnailWriter:
         """Quote a path for an FFmpeg concat demuxer manifest."""
         return "'" + Path(path).as_posix().replace("'", "\\'") + "'"
 
-    def _write_h264_concat(
+    def _write_concat(
         self,
         video_path: str,
         output_path: Path,
@@ -427,13 +481,20 @@ class FormatDispatchThumbnailWriter:
         preview_path: str,
         concat_path: str,
         output_format: str,
-        params: tuple[int, int, str, str, float],
+        params: tuple[str, int, int, str, str, float],
         stages: _SaveStages,
     ) -> bool:
-        """Prepend one H.264 frame and stream-copy the original video packets."""
+        """Prepend one matching frame and stream-copy the original packets."""
         ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-        width, height, profile, frame_rate, frame_duration = params
+        codec_name, width, height, profile, frame_rate, frame_duration = params
         duration_text = f"{frame_duration:.12g}"
+        encoder_args = (
+            ["-c:v", "libaom-av1", "-cpu-used", "8", "-row-mt", "1",
+             "-threads", "4", "-profile:v", "0", "-crf", "23", "-b:v", "0",
+             "-pix_fmt", "yuv420p"]
+            if codec_name == "av1"
+            else ["-c:v", "libx264", "-profile:v", profile, "-pix_fmt", "yuv420p"]
+        )
 
         stages.start("Encoding preview frame")
         subprocess.run(
@@ -443,9 +504,7 @@ class FormatDispatchThumbnailWriter:
                 "-frames:v", "1",
                 "-vf", f"scale={width}:{height}:flags=lanczos",
                 "-an", "-sn",
-                "-c:v", "libx264",
-                "-profile:v", profile,
-                "-pix_fmt", "yuv420p",
+                *encoder_args,
                 "-f", "mp4",
                 preview_path,
             ],
@@ -458,7 +517,8 @@ class FormatDispatchThumbnailWriter:
             preview_stream = preview.streams.video[0]
             preview_codec = preview_stream.codec_context
             if (
-                preview_codec.name != "h264"
+                (preview_codec.codec.id != _AV1_CODEC_ID if codec_name == "av1"
+                 else preview_codec.name != "h264")
                 or (preview_codec.profile or "").lower() != profile
                 or preview_codec.format is None
                 or preview_codec.format.name != "yuv420p"
@@ -467,6 +527,23 @@ class FormatDispatchThumbnailWriter:
                 or preview_stream.average_rate is None
                 or abs(float(preview_stream.average_rate) - 1 / frame_duration) > 0.001
             ):
+                logger.debug(
+                    "concat fast path skipped for '%s': encoded preview frame "
+                    "did not match source params (codec=%s, profile=%s, "
+                    "pix_fmt=%s, size=%dx%d, rate=%s; expected profile=%s, "
+                    "size=%dx%d, rate=%s)",
+                    video_path,
+                    preview_codec.name,
+                    preview_codec.profile,
+                    preview_codec.format.name if preview_codec.format else None,
+                    preview_stream.width,
+                    preview_stream.height,
+                    preview_stream.average_rate,
+                    profile,
+                    width,
+                    height,
+                    1 / frame_duration,
+                )
                 return False
 
         manifest = (
