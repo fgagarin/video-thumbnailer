@@ -260,6 +260,58 @@ class TestThumbnailWriter:
             expected_position_ms / video.frame_step_ms
         )
 
+    def test_replacing_mp4_preview_does_not_reencode_or_extend_video(
+        self,
+        loader: PyAVVideoLoader,
+        writer: FormatDispatchThumbnailWriter,
+        sample_video: Path,
+    ) -> None:
+        video = loader.load(str(sample_video))
+        first_preview = Image.new("RGB", (320, 240), color=(240, 20, 20))
+        first_result = writer.write(video, first_preview, position_ms=400)
+        assert first_result.success, first_result.error_message
+
+        before_replacement = loader.load(str(sample_video))
+        with av.open(str(sample_video)) as container:
+            playable = next(
+                stream
+                for stream in container.streams.video
+                if not bool(stream.disposition & stream.disposition.attached_pic)
+            )
+            frame_count_before = sum(1 for _ in container.decode(playable))
+
+        stages: list[str] = []
+        second_preview = Image.new("RGB", (320, 240), color=(20, 240, 20))
+        second_result = writer.write(
+            before_replacement,
+            second_preview,
+            position_ms=800,
+            on_progress=lambda name, elapsed: (
+                stages.append(name) if elapsed is None else None
+            ),
+        )
+
+        assert second_result.success, second_result.error_message
+        assert second_result.duration_shift_ms == 0
+        assert "Removing previous preview frame" in stages
+        assert "Copying video streams" in stages
+        assert "Encoding video" not in stages
+        with av.open(str(sample_video)) as container:
+            playable = next(
+                stream
+                for stream in container.streams.video
+                if not bool(stream.disposition & stream.disposition.attached_pic)
+            )
+            frames = list(container.decode(playable))
+        assert len(frames) == frame_count_before
+        first_frame = self._first_playable_frame(sample_video)
+        first_frame_mean = ImageStat.Stat(first_frame).mean
+        assert first_frame_mean[1] > first_frame_mean[0] + 80
+        assert first_frame_mean[1] > first_frame_mean[2] + 80
+
+        reopened = loader.load(str(sample_video))
+        assert reopened.thumbnail_position_ms == 800
+
     def test_write_mp4_sets_selected_frame_as_first_video_frame(
         self,
         loader: PyAVVideoLoader,

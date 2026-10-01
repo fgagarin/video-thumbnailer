@@ -166,6 +166,10 @@ class FormatDispatchThumbnailWriter:
                     ),
                     frame_step_ms=video.frame_step_ms,
                     write_mp4_covr=video.format is VideoFormat.MP4,
+                    replace_existing_preview=(
+                        video.thumbnail_position_ms is not None
+                        and video.existing_thumbnail is not None
+                    ),
                 )
             elif video.format in _MKV_FORMATS:
                 self._embed_mkv_webm(video.path, jpeg_bytes, stages)
@@ -238,7 +242,13 @@ class FormatDispatchThumbnailWriter:
             return None
         if Path(video.path).suffix.lower() != ".mp4":
             return "The fast copy path supports .mp4 files only."
-        _, reason = self._concat_decision(video.path)
+        replace_existing_preview = (
+            video.thumbnail_position_ms is not None
+            and video.existing_thumbnail is not None
+        )
+        _, reason = self._concat_decision(
+            video.path, replace_existing_preview=replace_existing_preview
+        )
         return reason
 
     def _embed_mp4_mov(
@@ -252,6 +262,7 @@ class FormatDispatchThumbnailWriter:
         frame_number: int | None,
         frame_step_ms: int,
         write_mp4_covr: bool,
+        replace_existing_preview: bool,
     ) -> int:
         """Embed a preview and cover art into an MP4 or MOV file.
 
@@ -264,8 +275,13 @@ class FormatDispatchThumbnailWriter:
         video_dir = os.path.dirname(os.path.abspath(video_path))
         video_ext = os.path.splitext(video_path)[1].lower() or ".mp4"
         stages.start("Inspecting video streams")
+        replace_existing_preview = (
+            replace_existing_preview and video_ext == ".mp4"
+        )
         if video_ext == ".mp4":
-            concat_params, _ = self._concat_decision(video_path)
+            concat_params, _ = self._concat_decision(
+                video_path, replace_existing_preview=replace_existing_preview
+            )
         else:
             logger.debug(
                 "concat fast path skipped for '%s': extension %r is not .mp4",
@@ -286,8 +302,12 @@ class FormatDispatchThumbnailWriter:
         concat_fd, concat_path = tempfile.mkstemp(
             dir=video_dir, prefix=".vt_concat_", suffix=".txt"
         )
+        stripped_fd, stripped_path = tempfile.mkstemp(
+            dir=video_dir, prefix=".vt_stripped_", suffix=".mp4"
+        )
         os.close(preview_fd)
         os.close(concat_fd)
+        os.close(stripped_fd)
         try:
             with os.fdopen(cover_fd, "wb") as f:
                 f.write(jpeg_bytes)
@@ -306,13 +326,18 @@ class FormatDispatchThumbnailWriter:
                     cover_path,
                     preview_path,
                     concat_path,
+                    stripped_path,
                     output_format,
                     concat_params,
                     stages,
+                    replace_existing_preview,
                 ):
-                    # The concat path prepends a new frame, pushing every original
-                    # frame (and the one the user selected) forward in time.
-                    shift_ms = round(concat_params[5] * 1000)
+                    # Initial saves prepend a frame; replacements keep the duration.
+                    shift_ms = (
+                        0
+                        if replace_existing_preview
+                        else round(concat_params[5] * 1000)
+                    )
                     shifted_position_ms = (
                         position_ms + shift_ms if position_ms is not None else None
                     )
@@ -376,7 +401,13 @@ class FormatDispatchThumbnailWriter:
             atomic_replace(video_path, _ffmpeg_write_fn, copy_existing=False)
             stages.start("Cleaning up temporary files")
         finally:
-            for temp_path in (cover_path, frame_path, preview_path, concat_path):
+            for temp_path in (
+                cover_path,
+                frame_path,
+                preview_path,
+                concat_path,
+                stripped_path,
+            ):
                 try:
                     os.unlink(temp_path)
                 except FileNotFoundError:
@@ -385,7 +416,7 @@ class FormatDispatchThumbnailWriter:
 
     @staticmethod
     def _concat_decision(
-        video_path: str,
+        video_path: str, *, replace_existing_preview: bool = False
     ) -> tuple[tuple[str, int, int, str, str, float] | None, str | None]:
         with av.open(video_path) as container:
             playable = [
@@ -404,10 +435,11 @@ class FormatDispatchThumbnailWriter:
                     None,
                     f"Expected one playable video stream; found {len(playable)}.",
                 )
-            if any(
+            has_attached_picture = any(
                 bool(stream.disposition & stream.disposition.attached_pic)
                 for stream in container.streams.video
-            ):
+            )
+            if has_attached_picture and not replace_existing_preview:
                 logger.debug(
                     "concat fast path skipped for '%s': file already has an "
                     "attached-picture video stream",
@@ -480,11 +512,13 @@ class FormatDispatchThumbnailWriter:
         cover_path: str,
         preview_path: str,
         concat_path: str,
+        stripped_path: str,
         output_format: str,
         params: tuple[str, int, int, str, str, float],
         stages: _SaveStages,
+        replace_existing_preview: bool,
     ) -> bool:
-        """Prepend one matching frame and stream-copy the original packets."""
+        """Prepend a matching frame, optionally replacing the existing preview."""
         ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
         codec_name, width, height, profile, frame_rate, frame_duration = params
         duration_text = f"{frame_duration:.12g}"
@@ -546,18 +580,50 @@ class FormatDispatchThumbnailWriter:
                 )
                 return False
 
+        concat_source_path = video_path
+        if replace_existing_preview:
+            with av.open(video_path) as source:
+                playable = next(
+                    stream
+                    for stream in source.streams.video
+                    if not bool(
+                        stream.disposition & stream.disposition.attached_pic
+                    )
+                )
+                playable_index = playable.index
+            stages.start("Removing previous preview frame")
+            subprocess.run(
+                [
+                    ffmpeg_exe, "-y",
+                    "-i", video_path,
+                    "-map", f"0:{playable_index}",
+                    "-c:v", "copy",
+                    "-bsf:v", "noise=drop='eq(n,0)'",
+                    "-an", "-sn",
+                    "-f", "mp4",
+                    stripped_path,
+                ],
+                check=True,
+                capture_output=True,
+                creationflags=_FFMPEG_CREATION_FLAGS,
+            )
+            concat_source_path = stripped_path
+
         manifest = (
             f"file {self._concat_quote(preview_path)}\n"
             f"duration {duration_text}\n"
-            f"file {self._concat_quote(video_path)}\n"
+            f"file {self._concat_quote(concat_source_path)}\n"
         )
         Path(concat_path).write_text(manifest, encoding="utf-8")
         stages.start("Copying video streams")
+        audio_offset_args = (
+            [] if replace_existing_preview else ["-itsoffset", duration_text]
+        )
         subprocess.run(
             [
                 ffmpeg_exe, "-y",
                 "-f", "concat", "-safe", "0", "-i", concat_path,
-                "-itsoffset", duration_text, "-i", video_path,
+                *audio_offset_args, "-i", video_path,
                 "-i", cover_path,
                 "-map", "0:v:0",
                 "-map", "1:a?",
