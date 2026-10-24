@@ -58,9 +58,15 @@ pub struct VideoFile {
 }
 
 impl VideoFile {
-    /// True when the file carries a preview previously inserted by FrameCover.
+    /// True when the file carries a preview previously inserted by FrameCover:
+    /// a cover plus either the saved frame position or (for previews made
+    /// from an image, which have no position) the preview marker tag, which
+    /// is read from the file on disk.
     pub fn has_inserted_preview(&self) -> bool {
-        self.thumbnail_position_ms.is_some() && self.existing_thumbnail.is_some()
+        self.existing_thumbnail.is_some()
+            && (self.thumbnail_position_ms.is_some()
+                || (self.format.is_mp4_family()
+                    && crate::mp4_tags::read_preview_source(&self.path).is_some()))
     }
 }
 

@@ -54,6 +54,8 @@ pub enum Operation {
     Extract,
     Convert,
     Save,
+    /// Reading an image file to use as the thumbnail.
+    Image,
 }
 
 /// Explain an operation failure without presenting diagnostics as advice.
@@ -117,6 +119,17 @@ fails there, try obtaining a fresh copy.\n\
 4. If the problem continues, check for an official app update \
 or use Report a problem and include the details.\n\n\
 Conversion does not change the original video."
+                .to_owned(),
+        ),
+        Operation::Image => (
+            "Could not use this image".to_owned(),
+            "The app could not read the picture. The file may be missing, \
+incomplete or damaged, or saved in a format the app cannot read.\n\n\
+What you can do:\n\
+1. Check that the picture opens in an image viewer.\n\
+2. Save it again as JPEG or PNG and try that file. FrameCover reads \
+JPEG, PNG, WebP and BMP pictures.\n\n\
+Your video has not been changed."
                 .to_owned(),
         ),
         Operation::Save => {

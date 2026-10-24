@@ -85,6 +85,7 @@ impl Backend for Fake {
         Ok(SourceCheck {
             playable: self.playable,
             remux_blocker: self.remux_blocker.clone(),
+            ..SourceCheck::default()
         })
     }
     fn locate_ffmpeg(&self) -> std::result::Result<(), String> {

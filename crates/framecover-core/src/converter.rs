@@ -4,7 +4,11 @@
 //! format allow a concat-compatible result; if the source cannot qualify, the
 //! remux fails, or its result is not eligible for the thumbnail writer's
 //! concat fast path, encode once to H.264/AAC trying
-//! each available H.264 encoder in turn. Only the first playable video and all
+//! each available H.264 encoder in turn. HEVC (including HDR10/HLG Main 10)
+//! and 10-bit H.264/AV1 qualify for the remux; HEVC is remuxed with the
+//! `hvc1` sample entry Apple players require. HDR or high-bit-depth sources
+//! that must be encoded try libx265 Main 10 (keeping their colour
+//! description) before falling back to 8-bit H.264. Only the first playable video and all
 //! audio tracks are kept. The source is never modified and the destination is
 //! published only after FFmpeg succeeds (hardlink, so a concurrently created
 //! file is never clobbered, unless overwrite was approved).
@@ -15,6 +19,7 @@ use std::process::Output;
 
 use log::{info, warn};
 
+use crate::color::TargetColor;
 use crate::error::{Error, Result};
 use crate::ffmpeg::{self, Tool};
 use crate::probe;
@@ -115,6 +120,13 @@ pub(crate) struct SourceCheck {
     /// `Some(reason)`: skip the remux and encode
     /// ([`thumbnail_writer::remux_ineligibility_reason`]).
     pub remux_blocker: Option<String>,
+    /// HEVC video: remuxed with the `hvc1` sample entry (Apple players
+    /// reject `hev1`, ffmpeg's MP4 default).
+    pub hevc: bool,
+    /// HDR or high-bit-depth video: when it must be encoded, libx265 Main 10
+    /// with this colour description is tried before the 8-bit H.264
+    /// encoders, so HDR is not flattened into SDR.
+    pub deep_color: Option<TargetColor>,
 }
 
 struct RealBackend;
@@ -122,9 +134,14 @@ struct RealBackend;
 impl Backend for RealBackend {
     fn inspect_source(&self, path: &Path) -> Result<SourceCheck> {
         let info = probe::probe(path)?;
+        let video = info.first_playable_video();
         Ok(SourceCheck {
-            playable: info.first_playable_video().is_some(),
+            playable: video.is_some(),
             remux_blocker: thumbnail_writer::remux_ineligibility_reason(&info),
+            hevc: video.is_some_and(|s| s.codec_name.as_deref() == Some("hevc")),
+            deep_color: video
+                .filter(|s| s.is_hdr() || s.bit_depth().unwrap_or(8) > 8)
+                .map(TargetColor::of),
         })
     }
     fn locate_ffmpeg(&self) -> std::result::Result<(), String> {
@@ -319,7 +336,17 @@ pub(crate) fn convert_with(
             info!("MP4 remux skipped, source requires normalization: {blocker}");
             Some(blocker)
         } else {
-            remux(backend, &common, &output, &temporary, &mut on_progress)?
+            let mut remux_output = output.clone();
+            if source_check.hevc {
+                remux_output.splice(0..0, [os("-tag:v"), os("hvc1")]);
+            }
+            remux(
+                backend,
+                &common,
+                &remux_output,
+                &temporary,
+                &mut on_progress,
+            )?
         };
         if let Some(reason) = reason {
             transcode(
@@ -329,6 +356,7 @@ pub(crate) fn convert_with(
                 &temporary,
                 &mut on_progress,
                 &reason,
+                source_check.deep_color.as_ref(),
             )?;
         }
 
@@ -414,13 +442,63 @@ fn transcode(
     temporary: &Path,
     on_progress: &mut Option<&mut dyn FnMut(&str)>,
     reason: &str,
+    deep_color: Option<&TargetColor>,
 ) -> Result<()> {
     let listing = backend.run(vec![os("-hide_banner"), os("-encoders")])?;
     let available = parse_encoders(&String::from_utf8_lossy(&listing.stdout));
+    let has = |name: &str| available.iter().any(|a| a == name);
+    if let Some(color) = deep_color
+        && has("libx265")
+        && has("aac")
+    {
+        if let Some(cb) = on_progress.as_mut() {
+            cb("Encoding MP4 with libx265 (10-bit) / AAC");
+        }
+        let mut args = common.to_vec();
+        args.extend(
+            [
+                "-c:v",
+                "libx265",
+                "-preset",
+                "medium",
+                "-crf",
+                "20",
+                "-profile:v",
+                "main10",
+                "-tag:v",
+                "hvc1",
+                "-x265-params",
+                "log-level=error",
+                "-vf",
+                "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+                "-pix_fmt",
+                "yuv420p10le",
+            ]
+            .map(os),
+        );
+        args.extend(color.encoder_args().into_iter().map(OsString::from));
+        args.extend(["-c:a", "aac", "-b:a", "192k"].map(os));
+        args.extend(output.iter().cloned());
+        match backend.run(args) {
+            Ok(_) => match backend.concat_reason(temporary).map_err(invalid_output)? {
+                None => return Ok(()),
+                Some(incompatibility) => {
+                    warn!("libx265 output incompatible: {incompatibility}")
+                }
+            },
+            Err(Error::Ffmpeg { code, stderr }) => {
+                warn!(
+                    "libx265 encoding failed: {}",
+                    failure_details(code, &stderr)
+                )
+            }
+            Err(other) => return Err(other),
+        }
+    }
     let candidates: Vec<&str> = H264_ENCODERS
         .iter()
         .copied()
-        .filter(|name| available.iter().any(|a| a == name))
+        .filter(|name| has(name))
         .collect();
     if candidates.is_empty() || !available.iter().any(|a| a == "aac") {
         return Err(Error::Conversion(format!(

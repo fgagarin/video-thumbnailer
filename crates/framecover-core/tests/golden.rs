@@ -790,7 +790,7 @@ fn apply_intentional_deviations(case: &str, golden: &mut Value, cmds: &mut Vec<V
         );
     };
     match case {
-        "save_mov" | "save_mp4_with_thumb" | "save_mp4_yuv444p" | "save_mp4_hevc" => {
+        "save_mov" | "save_mp4_with_thumb" | "save_mp4_yuv444p" => {
             first_reencode(golden, cmds, 0, "/save");
         }
         "resave_mov" => {
@@ -870,7 +870,113 @@ fn apply_intentional_deviations(case: &str, golden: &mut Value, cmds: &mut Vec<V
         }
         *cmds = mp4_cmds;
     }
+
+    // Fix 7: an inserted preview also carries the `video-thumbnailer-preview`
+    // marker item (`frame` here), so previews made from an image, which have
+    // no position tags, are still recognised and replaced on re-save.
+    for at in ["/save", "/first_save", "/second_save"] {
+        let Some(keys) = golden
+            .pointer_mut(&format!("{at}/output/mp4_tags/keys"))
+            .and_then(Value::as_array_mut)
+        else {
+            continue;
+        };
+        if keys
+            .iter()
+            .any(|k| k == "----:com.apple.iTunes:video-thumbnailer-position-ms")
+        {
+            keys.push(json!("----:com.apple.iTunes:video-thumbnailer-preview"));
+            keys.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+        }
+    }
+
+    // Fix 8 (HDR / 10-bit / HEVC fast path): HEVC Main is concat-eligible.
+    // The preview frame is encoded with libx265 (same profile, `hvc1` tag,
+    // the source's colour range and chroma siting) and the source is stream
+    // copied like `save_mp4` (DTS repair for x265's reorder delay; the
+    // source's `hvc1` sample entry is restored afterwards, which runs no
+    // ffmpeg command). Output: still HEVC Main, one frame and 40 ms longer,
+    // tags 2040 ms / frame 51; no `reencode_reason`.
+    if case == "save_mp4_hevc" {
+        set(golden, "/fixture/reencode_reason", Value::Null);
+        set(
+            golden,
+            "/save/output/probe/streams/0/codec_name",
+            json!("hevc"),
+        );
+        set(
+            golden,
+            "/save/output/probe/streams/0/profile",
+            json!("Main"),
+        );
+        set(golden, "/save/output/probe/streams/0/nb_frames", json!(126));
+        set(
+            golden,
+            "/save/output/probe/streams/0/duration_ms",
+            json!(5040),
+        );
+        set(golden, "/save/output/load/duration_ms", json!(5040));
+        set(golden, "/save/result/duration_shift_ms", json!(40));
+        set(
+            golden,
+            "/save/output/load/thumbnail_frame_number",
+            json!(51),
+        );
+        set(
+            golden,
+            "/save/output/load/thumbnail_position_ms",
+            json!(2040),
+        );
+        set(golden, "/save/output/mp4_tags/frame_number", json!("51"));
+        set(golden, "/save/output/mp4_tags/position_ms", json!("2040"));
+        let (_, mp4_cmds) = load_golden("save_mp4").unwrap();
+        let mut hevc_cmds: Vec<Value> = mp4_cmds["commands"].as_array().unwrap().clone();
+        let rename = |s: &str| s.replace(".sample-thumbnail.save-", ".hevc-thumbnail.save-");
+        for cmd in &mut hevc_cmds {
+            for a in cmd["argv"].as_array_mut().unwrap().iter_mut() {
+                *a = json!(rename(a.as_str().unwrap()));
+            }
+            if let Some(m) = cmd.get_mut("concat_manifest") {
+                for line in m.as_array_mut().unwrap() {
+                    *line = json!(rename(line.as_str().unwrap()));
+                }
+            }
+        }
+        set_option(
+            &mut hevc_cmds,
+            0,
+            "-vf",
+            "scale=320:240:flags=lanczos,format=yuv420p",
+        );
+        set_option(&mut hevc_cmds, 0, "-c:v", "libx265");
+        set_option(&mut hevc_cmds, 0, "-profile:v", "main");
+        insert_before(
+            &mut hevc_cmds,
+            0,
+            "-video_track_timescale",
+            &[
+                "-tag:v",
+                "hvc1",
+                "-color_range",
+                "tv",
+                "-chroma_sample_location",
+                "left",
+                "-x265-params",
+                "log-level=error",
+            ],
+        );
+        insert_before(
+            &mut hevc_cmds,
+            1,
+            "-disposition:v:1",
+            &["-bsf:v:0", SETTS_X265],
+        );
+        *cmds = hevc_cmds;
+    }
 }
+
+/// Fix 8: x265's default reorder delay as repaired on the concat output.
+const SETTS_X265: &str = "setts=pts=PTS:dts='if(lt(N,2),STARTPTS+(0)-(2-N)*512,DTS)'";
 
 /// Fix 5: rewrite the Python overlay re-encode (command `i`) into the
 /// preview-inserting one for the 320x240 25 fps fixtures.

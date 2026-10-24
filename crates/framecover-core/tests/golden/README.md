@@ -67,7 +67,7 @@ saves use **3000 ms** on the produced copy. The destination is always
 | `resave_mov` | Save MOV twice: full re-encode both times |
 | `resave_mkv` | Save MKV twice: the old attachment is dropped (default stream selection) and one new `cover.jpg` is attached |
 | `save_mp4_yuv444p` | H.264 High 4:4:4 / yuv444p: concat-ineligible (profile and pix_fmt), full re-encode |
-| `save_mp4_hevc` | HEVC (`hvc1`): concat-ineligible (codec), full re-encode to H.264 |
+| `save_mp4_hevc` | HEVC (`hvc1`): concat-ineligible (codec), full re-encode to H.264 (the Rust port takes the HEVC fast path, see the deviations) |
 | `save_mp4_av1` | AV1 (libaom, 160x120): concat fast path with a libaom preview frame |
 | `convert_ts` | MPEG-TS H.264/AAC to MP4: `-c copy` remux accepted (no transcode) |
 | `convert_mpg` | MPEG-PS MPEG-2/MP2 to MP4: remux succeeds but is concat-ineligible, so it is transcoded with libx264/AAC |
@@ -234,3 +234,9 @@ with a comment per fix) and compares everything else against Python.
   profile, pixel format and dimensions first
   (`thumbnail_writer::remux_ineligibility_reason`); `convert_mpg` and
   `convert_wmv` encode without attempting the remux.
+- HEVC fast path (not a Python behaviour, a new feature): HEVC Main/Main 10
+  sources are concat-eligible, so `save_mp4_hevc` encodes a libx265 preview
+  frame (`hvc1`, the source's colour range and chroma siting) and stream
+  copies the source like `save_mp4`; the output stays HEVC Main with 126
+  frames and no `reencode_reason`. The source's `hvc1` sample entry is put
+  back afterwards (`sample_entries`, no ffmpeg command).

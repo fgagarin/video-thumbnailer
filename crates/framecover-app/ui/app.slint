@@ -53,6 +53,8 @@ export component AppWindow inherits Window {
     in property <string> save-tooltip;
     in property <bool> reencode-visible;
     in property <string> saved-label;
+    in property <bool> image-mode;
+    in property <bool> image-crop;
     in property <[FilmTile]> film-tiles;
     in property <bool> timeline-enabled;
     in property <bool> timeline-has-duration;
@@ -67,6 +69,9 @@ export component AppWindow inherits Window {
     callback save-copy();
     callback overwrite();
     callback show-reencode-reason();
+    callback open-image();
+    callback use-video-frame();
+    callback set-image-crop(bool);
     callback film-clicked(length);
     callback film-resized(length);
     callback timeline-pointer(float, bool);
@@ -124,6 +129,10 @@ export component AppWindow inherits Window {
                 root.save-copy();
                 return accept;
             }
+            if event.modifiers.control && (event.text == "i" || event.text == "I") {
+                root.open-image();
+                return accept;
+            }
             if event.text == "?" || (event.text == "/" && event.modifiers.shift) {
                 root.show-shortcuts();
                 return accept;
@@ -164,9 +173,14 @@ export component AppWindow inherits Window {
                 save-tooltip: root.save-tooltip;
                 reencode-visible: root.reencode-visible;
                 saved-label: root.saved-label;
+                image-mode: root.image-mode;
+                image-crop: root.image-crop;
                 save-copy => { root.save-copy(); }
                 overwrite => { root.overwrite(); }
                 show-reencode-reason => { root.show-reencode-reason(); }
+                open-image => { root.open-image(); }
+                use-video-frame => { root.use-video-frame(); }
+                set-image-crop(crop) => { root.set-image-crop(crop); }
             }
             if root.editor-visible: Filmstrip {
                 tiles: root.film-tiles;

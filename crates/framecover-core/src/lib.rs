@@ -4,6 +4,7 @@
 //! them for fakes in tests (mirroring the Python `Protocol`s).
 
 pub mod atomic_write;
+pub mod color;
 pub mod converter;
 pub mod error;
 pub mod ffmpeg;
@@ -15,6 +16,7 @@ pub mod models;
 pub mod mp4_tags;
 pub mod platform;
 pub mod probe;
+mod sample_entries;
 pub mod save_copy;
 pub mod thumbnail_writer;
 pub mod update_checker;

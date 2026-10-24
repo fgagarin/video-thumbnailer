@@ -22,9 +22,12 @@ use slint::{
     ComponentHandle, Image, ModelRc, Rgb8Pixel, SharedPixelBuffer, Timer, TimerMode, VecModel,
 };
 
+use framecover_core::imaging::{IMAGE_EXTENSIONS, ImageFit};
+
 use crate::controller::{
     CONFLICT_TITLE, CONVERT_TEXT, CONVERT_TITLE, CONVERTING_TITLE, ConflictChoice, Controller,
     Dialog, Dot, Effect, Event, OVERWRITE_TEXT, OVERWRITE_TITLE, OverwriteChoice, VIDEO_EXTENSIONS,
+    is_image_path,
 };
 use crate::error_report::{
     ErrorReport, build_google_search_url, build_issue_url, format_panic_report,
@@ -122,8 +125,14 @@ pub fn run() {
     app.bind();
     app.render();
     app.dispatch(Event::Startup);
-    if let Some(path) = std::env::args_os().nth(1) {
-        app.dispatch(Event::OpenPath(PathBuf::from(path)));
+    // `framecover video [image]`: an image after the video becomes its
+    // thumbnail source once the video is open.
+    let mut args = std::env::args_os().skip(1).map(PathBuf::from);
+    if let Some(path) = args.next() {
+        app.dispatch(Event::OpenPath(path));
+    }
+    if let Some(image) = args.next().filter(|p| is_image_path(p)) {
+        app.dispatch(Event::OpenPath(image));
     }
 
     if let Err(err) = app.window.run() {
@@ -276,6 +285,11 @@ impl App {
 
         on!(on_open_file, |app| app.dispatch(Event::OpenFileRequested));
         on!(on_path_clicked, |app| app.dispatch(Event::PathClicked));
+        on!(on_open_image, |app| app.dispatch(Event::OpenImageRequested));
+        on!(on_use_video_frame, |app| app.dispatch(Event::UseVideoFrame));
+        on!(on_set_image_crop, |app, crop| app.dispatch(
+            Event::SetImageFit(if crop { ImageFit::Crop } else { ImageFit::Fit })
+        ));
         on!(on_save_copy, |app| app.dispatch(Event::SaveCopyClicked));
         on!(on_overwrite, |app| app.dispatch(Event::OverwriteClicked));
         on!(on_show_reencode_reason, |app| app
@@ -410,6 +424,30 @@ impl App {
                     },
                 );
             }
+            Effect::PickImageFile { start_dir } => self.pick_image_file(start_dir),
+            Effect::LoadImage {
+                path,
+                width,
+                height,
+                token,
+            } => spawn_guarded(
+                "load-image",
+                move || {
+                    workers::run_load_image(&path, width, height)
+                        .map(|(fit, crop)| (path, fit, crop))
+                },
+                move |outcome| {
+                    post(match outcome.and_then(|r| r) {
+                        Ok((path, fit, crop)) => Event::ImageLoaded {
+                            token,
+                            path,
+                            fit,
+                            crop,
+                        },
+                        Err(details) => Event::ImageLoadFailed { token, details },
+                    })
+                },
+            ),
             Effect::PersistLastOpenDirectory(dir) => {
                 self.settings.borrow_mut().set_last_open_directory(&dir)
             }
@@ -579,6 +617,25 @@ impl App {
         }
     }
 
+    fn pick_image_file(self: &Rc<Self>, start_dir: PathBuf) {
+        let dialog = rfd::AsyncFileDialog::new()
+            .set_title("Use image as thumbnail")
+            .set_directory(start_dir)
+            .add_filter("Images", IMAGE_EXTENSIONS)
+            .add_filter("All files", &["*"])
+            .set_parent(&self.window.window().window_handle());
+        let weak = Rc::downgrade(self);
+        let spawned = slint::spawn_local(async move {
+            let picked = dialog.pick_file().await;
+            if let (Some(file), Some(app)) = (picked, weak.upgrade()) {
+                app.dispatch(Event::OpenImage(file.path().to_owned()));
+            }
+        });
+        if let Err(err) = spawned {
+            log::error!("could not show the file dialog: {err}");
+        }
+    }
+
     fn pick_convert_destination(self: &Rc<Self>, source: PathBuf, suggested: PathBuf) {
         let mut dialog = rfd::AsyncFileDialog::new()
             .set_title("Save converted MP4")
@@ -716,12 +773,12 @@ impl App {
                 .into(),
         );
         w.set_frame_title(s.frame_title().into());
-        w.set_has_frame(s.candidate.is_some());
-        if let Some(image) =
-            Self::cached_image(&self.frame_cache, s.candidate.as_ref().map(|c| &c.0))
-        {
+        w.set_has_frame(s.panel_image().is_some());
+        if let Some(image) = Self::cached_image(&self.frame_cache, s.panel_image()) {
             w.set_frame_image(image);
         }
+        w.set_image_mode(s.cover.is_some());
+        w.set_image_crop(s.cover.as_ref().is_some_and(|c| c.mode == ImageFit::Crop));
         w.set_has_thumb(s.thumbnail.is_some());
         if let Some(image) = Self::cached_image(&self.thumb_cache, s.thumbnail.as_ref()) {
             w.set_thumb_image(image);

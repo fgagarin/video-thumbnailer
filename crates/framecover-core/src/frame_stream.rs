@@ -20,8 +20,9 @@
 //! ffmpeg shifts a session's timestamps by `-round(seek + start_time)`, so a
 //! frame's absolute timestamp is `pts + round(seek + start_time)`; the
 //! container start time comes from the input summary ffmpeg prints. The
-//! RGB conversion is the same swscale conversion the extractor uses, so the
-//! returned pixels are identical. Any session failure falls back to a
+//! RGB conversion is the same swscale conversion the extractor uses (for HDR
+//! sources the same tone-mapping chain, [`crate::color::display_filter`]),
+//! so the returned pixels are identical. Any session failure falls back to a
 //! one-off [`FfmpegFrameExtractor`] call for that request.
 
 use std::collections::{BTreeMap, VecDeque};
@@ -34,6 +35,7 @@ use std::time::Instant;
 
 use image::RgbImage;
 
+use crate::color;
 use crate::error::Result;
 use crate::ffmpeg::{self, Tool};
 use crate::frames::{FfmpegFrameExtractor, FrameExtractor, format_secs, seek_point_us};
@@ -603,22 +605,27 @@ impl Session {
         if seek_us > 0 {
             cmd.arg("-ss").arg(format_secs(seek_us));
         }
-        cmd.arg("-i").arg(path).args([
-            "-map",
-            "0:V:0",
-            "-vf",
-            "showinfo=checksum=0",
-            // One output frame per decoded frame, whatever the frame rate.
-            "-fps_mode",
-            "passthrough",
-            "-c:v",
-            "rawvideo",
-            "-pix_fmt",
-            "rgb24",
-            "-f",
-            "rawvideo",
-            "-",
-        ]);
+        // HDR sources: the extractor's tone-mapping chain, then `showinfo`.
+        let filter = match color::display_filter_for(path) {
+            Some(tonemap) => format!("{tonemap},showinfo=checksum=0"),
+            None => "showinfo=checksum=0".to_owned(),
+        };
+        cmd.arg("-i")
+            .arg(path)
+            .args(["-map", "0:V:0", "-vf"])
+            .arg(filter)
+            .args([
+                // One output frame per decoded frame, whatever the frame rate.
+                "-fps_mode",
+                "passthrough",
+                "-c:v",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "-f",
+                "rawvideo",
+                "-",
+            ]);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = cmd
             .spawn()

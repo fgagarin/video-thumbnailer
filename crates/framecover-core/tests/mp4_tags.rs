@@ -5,7 +5,10 @@ mod support;
 
 use std::path::Path;
 
-use framecover_core::mp4_tags::{read_thumbnail_source, write_covr, write_thumbnail_source};
+use framecover_core::mp4_tags::{
+    PREVIEW_FROM_FRAME, PREVIEW_FROM_IMAGE, read_preview_source, read_thumbnail_source, write_covr,
+    write_thumbnail_source,
+};
 use mp4ameta::{DataIdent, Tag};
 
 fn encoder_tag(path: &Path) -> Option<String> {
@@ -62,6 +65,33 @@ fn roundtrip_preserves_media_with_faststart() {
     extra.extend(["-movflags", "+faststart"]);
     common::generate_video(&path, 2, 160, 120, &extra);
     check_roundtrip(&path);
+}
+
+#[test]
+fn preview_marker_tracks_image_and_frame_covers() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = common::sample_video(dir.path());
+    assert_eq!(read_preview_source(&path), None);
+    let jpeg = framecover_core::imaging::cover_jpeg(&common::sample_image()).unwrap();
+
+    // A frame preview: cover, then its position.
+    write_covr(&path, &jpeg).unwrap();
+    write_thumbnail_source(&path, 7, 280).unwrap();
+    assert_eq!(
+        read_preview_source(&path).as_deref(),
+        Some(PREVIEW_FROM_FRAME)
+    );
+    assert_eq!(read_thumbnail_source(&path), (Some(7), Some(280)));
+
+    // Replaced by an image preview: marked, and the old position is gone so
+    // it is not restored on the next load.
+    write_covr(&path, &jpeg).unwrap();
+    assert_eq!(
+        read_preview_source(&path).as_deref(),
+        Some(PREVIEW_FROM_IMAGE)
+    );
+    assert_eq!(read_thumbnail_source(&path), (None, None));
+    assert_eq!(read_preview_source(&dir.path().join("missing.mp4")), None);
 }
 
 #[test]

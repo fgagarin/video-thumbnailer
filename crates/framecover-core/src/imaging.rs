@@ -72,6 +72,66 @@ pub fn decode_rgb(bytes: &[u8]) -> Result<RgbImage> {
         .map_err(|e| Error::Other(format!("image decoding failed: {e}")))
 }
 
+/// How an image of another aspect ratio is placed into a video frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ImageFit {
+    /// Scale to fit entirely inside the frame; black bars fill the rest.
+    #[default]
+    Fit,
+    /// Scale to cover the whole frame; the overflow is cropped (centred).
+    Crop,
+}
+
+/// Place `img` into a `width`x`height` frame according to `mode`, scaling
+/// up or down with Lanczos.
+pub fn compose(img: &RgbImage, width: u32, height: u32, mode: ImageFit) -> RgbImage {
+    let (width, height) = (width.max(1), height.max(1));
+    let (iw, ih) = (img.width().max(1) as f64, img.height().max(1) as f64);
+    let scale = match mode {
+        ImageFit::Fit => (width as f64 / iw).min(height as f64 / ih),
+        ImageFit::Crop => (width as f64 / iw).max(height as f64 / ih),
+    };
+    let sw = ((iw * scale).round() as u32).max(1);
+    let sh = ((ih * scale).round() as u32).max(1);
+    let scaled = if (sw, sh) == img.dimensions() {
+        img.clone()
+    } else {
+        image::imageops::resize(img, sw, sh, FilterType::Lanczos3)
+    };
+    let mut canvas = RgbImage::new(width, height);
+    // Signed offsets: negative when cropping.
+    let dx = (i64::from(width) - i64::from(sw)) / 2;
+    let dy = (i64::from(height) - i64::from(sh)) / 2;
+    image::imageops::overlay(&mut canvas, &scaled, dx, dy);
+    canvas
+}
+
+/// Load a still image file (JPEG, PNG, WebP, BMP) as RGB, applying its EXIF
+/// orientation so phone photos are upright.
+pub fn load_image(path: &std::path::Path) -> Result<RgbImage> {
+    use image::ImageDecoder;
+    let fail = |e: &dyn std::fmt::Display| {
+        Error::InvalidInput(format!(
+            "Could not read the image '{}': {e}",
+            path.display()
+        ))
+    };
+    let reader = image::ImageReader::open(path)
+        .map_err(|e| fail(&e))?
+        .with_guessed_format()
+        .map_err(|e| fail(&e))?;
+    let mut decoder = reader.into_decoder().map_err(|e| fail(&e))?;
+    let orientation = decoder.orientation().ok();
+    let mut img = DynamicImage::from_decoder(decoder).map_err(|e| fail(&e))?;
+    if let Some(orientation) = orientation {
+        img.apply_orientation(orientation);
+    }
+    Ok(img.into_rgb8())
+}
+
+/// File extensions [`load_image`] accepts (for file dialogs and drops).
+pub const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp"];
+
 /// Cover art bytes as written by the thumbnail writer: fit 640x360, JPEG q90.
 pub fn cover_jpeg(frame: &RgbImage) -> Result<Vec<u8>> {
     encode_jpeg(&thumbnail(frame, MAX_THUMB_W, MAX_THUMB_H), JPEG_QUALITY)
@@ -87,6 +147,48 @@ mod tests {
         assert_eq!(fit_within(1080, 1920, 640, 360), (203, 360));
         assert_eq!(fit_within(320, 240, 640, 360), (320, 240));
         assert_eq!(fit_within(1000, 400, 640, 360), (640, 256));
+    }
+
+    #[test]
+    fn compose_fit_letterboxes_and_crop_fills() {
+        // A wide red image into a 4:3 frame.
+        let wide = RgbImage::from_pixel(400, 100, image::Rgb([255, 0, 0]));
+        let fit = compose(&wide, 320, 240, ImageFit::Fit);
+        assert_eq!(fit.dimensions(), (320, 240));
+        assert_eq!(fit.get_pixel(160, 5).0, [0, 0, 0], "black bar on top");
+        assert_eq!(fit.get_pixel(160, 120).0, [255, 0, 0]);
+        let crop = compose(&wide, 320, 240, ImageFit::Crop);
+        assert_eq!(crop.dimensions(), (320, 240));
+        assert_eq!(crop.get_pixel(0, 0).0, [255, 0, 0], "no bars when cropping");
+        assert_eq!(crop.get_pixel(319, 239).0, [255, 0, 0]);
+    }
+
+    #[test]
+    fn crop_keeps_the_centre() {
+        // Left half blue, right half green, 200x100 into a square: the centre
+        // column shows both halves meeting.
+        let mut img = RgbImage::from_pixel(200, 100, image::Rgb([0, 0, 255]));
+        for x in 100..200 {
+            for y in 0..100 {
+                img.put_pixel(x, y, image::Rgb([0, 255, 0]));
+            }
+        }
+        let crop = compose(&img, 100, 100, ImageFit::Crop);
+        assert_eq!(crop.get_pixel(10, 50).0, [0, 0, 255]);
+        assert_eq!(crop.get_pixel(90, 50).0, [0, 255, 0]);
+    }
+
+    #[test]
+    fn load_image_reads_png() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.png");
+        std::fs::write(
+            &path,
+            encode_png(&RgbImage::from_pixel(3, 2, image::Rgb([1, 2, 3]))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(load_image(&path).unwrap().dimensions(), (3, 2));
+        assert!(load_image(&dir.path().join("missing.png")).is_err());
     }
 
     #[test]

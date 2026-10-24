@@ -101,6 +101,25 @@ pub fn run_frame_at(source: &mut dyn FrameSource, position_ms: u64) -> Result<Rg
     source.frame_at(position_ms).map_err(|e| details(&e))
 }
 
+/// An image file composed into a `width`x`height` video frame, fitted and
+/// cropped (both are prepared so switching between them is instant).
+pub fn run_load_image(
+    path: &Path,
+    width: u32,
+    height: u32,
+) -> Result<(RgbImage, RgbImage), String> {
+    use framecover_core::imaging::{ImageFit, compose, load_image};
+    let image = load_image(path).map_err(|e| details(&e))?;
+    Ok(std::thread::scope(|scope| {
+        let crop = scope.spawn(|| compose(&image, width, height, ImageFit::Crop));
+        let fit = compose(&image, width, height, ImageFit::Fit);
+        (
+            fit,
+            crop.join().unwrap_or_else(|p| std::panic::resume_unwind(p)),
+        )
+    }))
+}
+
 pub fn run_convert(
     converter: &dyn VideoConverter,
     source: &Path,
@@ -507,6 +526,115 @@ mod production_tests {
         let result = run_apply(&services, &job, &mut |_, _| {});
         assert!(result.success, "{:?}", result.error_message);
         assert!(loaded(&services, &source).existing_thumbnail.is_some());
+    }
+
+    /// Frames of the playable (non-cover) video stream.
+    fn video_frame_count(path: &Path) -> u64 {
+        use framecover_core::ffmpeg::{Tool, command, run};
+        let output = run(command(Tool::Ffprobe)
+            .unwrap()
+            .args([
+                "-v",
+                "error",
+                "-count_packets",
+                "-select_streams",
+                "v",
+                "-show_entries",
+                "stream=nb_read_packets:stream_disposition=attached_pic",
+                "-of",
+                "json",
+            ])
+            .arg(path))
+        .expect("ffprobe");
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        json["streams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["disposition"]["attached_pic"] == 0)
+            .and_then(|s| s["nb_read_packets"].as_str()?.parse().ok())
+            .expect("a playable video stream")
+    }
+
+    fn write_png(path: &Path, width: u32, height: u32, rgb: [u8; 3]) {
+        let image = RgbImage::from_pixel(width, height, image::Rgb(rgb));
+        std::fs::write(path, framecover_core::imaging::encode_png(&image).unwrap()).unwrap();
+    }
+
+    /// An image cover saved in place is marked as an inserted preview, so a
+    /// second image (and then a frame) replaces it instead of stacking.
+    #[test]
+    fn image_covers_replace_each_other_in_place() {
+        use framecover_core::mp4_tags::{
+            PREVIEW_FROM_FRAME, PREVIEW_FROM_IMAGE, read_preview_source,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("clip.mp4");
+        generate(
+            &source,
+            &["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac"],
+        );
+        let (tall, wide) = (dir.path().join("tall.png"), dir.path().join("wide.png"));
+        write_png(&tall, 100, 300, [255, 0, 0]);
+        write_png(&wide, 600, 100, [0, 255, 0]);
+        let services = Services::production();
+        let frames_before = video_frame_count(&source);
+
+        let save = |video: VideoFile, thumbnail: RgbImage, position_ms: Option<u64>| {
+            let job = SaveJob {
+                video: Arc::new(video),
+                thumbnail: Arc::new(thumbnail),
+                position_ms,
+                destination: None,
+                overwrite: false,
+            };
+            let result = run_apply(&services, &job, &mut |_, _| {});
+            assert!(result.success, "{:?}", result.error_message);
+            loaded(&services, &source)
+        };
+
+        let video = loaded(&services, &source);
+        assert!(!video.has_inserted_preview());
+        let (fit, _) = run_load_image(&tall, video.width, video.height).unwrap();
+        assert_eq!(fit.dimensions(), (320, 240));
+        let video = save(video, fit, None);
+        assert!(video.existing_thumbnail.is_some());
+        assert_eq!(
+            (video.thumbnail_position_ms, video.thumbnail_frame_number),
+            (None, None),
+            "no position to restore"
+        );
+        assert!(video.has_inserted_preview());
+        assert_eq!(
+            read_preview_source(&source).as_deref(),
+            Some(PREVIEW_FROM_IMAGE)
+        );
+        assert_eq!(video_frame_count(&source), frames_before + 1);
+
+        let (_, crop) = run_load_image(&wide, video.width, video.height).unwrap();
+        assert_eq!(crop.get_pixel(0, 0).0, [0, 255, 0], "cropped: no bars");
+        let video = save(video, crop, None);
+        assert!(video.has_inserted_preview());
+        assert_eq!(video_frame_count(&source), frames_before + 1, "replaced");
+
+        // Back to a frame: the position is recorded again.
+        let frame = services.extractor.extract(&video, 1500).unwrap();
+        let video = save(video, frame, Some(1500));
+        assert_eq!(video.thumbnail_position_ms, Some(1500));
+        assert_eq!(
+            read_preview_source(&source).as_deref(),
+            Some(PREVIEW_FROM_FRAME)
+        );
+        assert_eq!(video_frame_count(&source), frames_before + 1);
+    }
+
+    #[test]
+    fn unreadable_image_reports_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broken.png");
+        std::fs::write(&path, b"not a picture").unwrap();
+        let err = run_load_image(&path, 320, 240).unwrap_err();
+        assert!(err.contains("broken.png"), "{err}");
     }
 
     #[test]

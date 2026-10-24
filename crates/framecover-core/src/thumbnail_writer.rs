@@ -8,6 +8,18 @@
 //!   earlier versions) cannot skew the frame rate. Falls back
 //!   to a full H.264 re-encode that inserts the frame the same way (one extra
 //!   first frame; a previously inserted one is trimmed on re-save).
+//! * Fast-path formats: H.264 Baseline/Main/High (yuv420p) and High 10
+//!   (yuv420p10le), HEVC Main/Main 10 (libx265, keeping `hvc1`/`hev1`) and
+//!   AV1 Main 8/10-bit. Beyond the original 8-bit SDR H.264/AV1 path the
+//!   preview is encoded in the source's colour description (primaries,
+//!   transfer, matrix, range, chroma siting; PQ/HLG via zscale with SDR white
+//!   at 203 cd/m², see [`crate::color`]) and repeats the HDR10 mastering /
+//!   light-level metadata. HEVC outputs get the source's own sample entry
+//!   back for every source sample ([`crate::sample_entries`]). Dolby Vision,
+//!   4:2:2/4:4:4, 12-bit and interlaced video are re-encoded: HDR and
+//!   high-bit-depth sources with libx265 Main 10 (`hvc1`, colour and HDR10
+//!   metadata kept) or, for 10-bit H.264, libx264 High 10 — never flattened
+//!   into 8-bit SDR.
 //! * MOV (`.mov`, `.m4v`): the same paths, muxed as QuickTime (`-f mov`);
 //!   the cover is written as a `covr` item since the mov muxer drops
 //!   attached_pic streams. Other MP4-family extensions always re-encode.
@@ -27,11 +39,13 @@ use image::RgbImage;
 use log::{debug, info};
 
 use crate::atomic_write::{self, atomic_replace};
+use crate::color::{self, TargetColor};
 use crate::error::{Error, Result};
 use crate::imaging;
 use crate::models::{ApplyError, ApplyResult, ProgressFn, Stages, VideoFile, VideoFormat};
 use crate::mp4_tags;
-use crate::probe::{self, ProbeInfo, Rational, Stream};
+use crate::probe::{self, HdrStaticMetadata, ProbeInfo, Rational, Stream};
+use crate::sample_entries;
 
 /// Embeds a thumbnail in place. Never fails: errors are in the [`ApplyResult`].
 pub trait ThumbnailWriter: Send + Sync {
@@ -176,7 +190,35 @@ fn h264_profile(profile: &str) -> Option<&'static str> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConcatCodec {
     H264,
+    Hevc,
     Av1,
+}
+
+/// 8-bit and 10-bit 4:2:0, the pixel formats the fast path can encode.
+const PIX_FMT_8: &str = "yuv420p";
+const PIX_FMT_10: &str = "yuv420p10le";
+
+/// A codec/profile/pixel format combination the preview encoder can match:
+/// `(codec, encoder profile, ffprobe profile in lower case, pixel format)`.
+fn concat_format(
+    codec_name: &str,
+    profile: &str,
+    pix_fmt: &str,
+) -> Option<(ConcatCodec, &'static str, &'static str, &'static str)> {
+    use ConcatCodec::*;
+    Some(match (codec_name, profile, pix_fmt) {
+        ("h264", "baseline" | "constrained baseline", PIX_FMT_8) => {
+            (H264, "baseline", "baseline", PIX_FMT_8)
+        }
+        ("h264", "main", PIX_FMT_8) => (H264, "main", "main", PIX_FMT_8),
+        ("h264", "high", PIX_FMT_8) => (H264, "high", "high", PIX_FMT_8),
+        ("h264", "high 10", PIX_FMT_10) => (H264, "high10", "high 10", PIX_FMT_10),
+        ("hevc", "main", PIX_FMT_8) => (Hevc, "main", "main", PIX_FMT_8),
+        ("hevc", "main 10", PIX_FMT_10) => (Hevc, "main10", "main 10", PIX_FMT_10),
+        ("av1", "main", PIX_FMT_8) => (Av1, "main", "main", PIX_FMT_8),
+        ("av1", "main", PIX_FMT_10) => (Av1, "main", "main", PIX_FMT_10),
+        _ => return None,
+    })
 }
 
 /// Parameters the one-frame preview clip must match.
@@ -185,7 +227,21 @@ struct ConcatParams {
     codec: ConcatCodec,
     width: u32,
     height: u32,
+    /// Encoder profile (`-profile:v`).
     profile: &'static str,
+    /// The source's profile as ffprobe reports it, lower case.
+    probe_profile: &'static str,
+    pix_fmt: &'static str,
+    /// Colour description to reproduce, `None` for 8-bit SDR H.264/AV1
+    /// sources (the original fast path, unchanged: plain scale, no tags).
+    color: Option<TargetColor>,
+    /// HEVC sample entry type (`hvc1`/`hev1`) to keep.
+    codec_tag: Option<String>,
+    /// MP4/MOV `track_ID` of the source video (HEVC sample entry copy).
+    source_track_id: Option<u32>,
+    /// HDR10 static metadata repeated in the preview (PQ sources; filled
+    /// in by [`embed_mp4_mov`], which may read it from the first frame).
+    hdr: Option<HdrStaticMetadata>,
     /// The stream's effective frame rate ([`Stream::effective_rate`]) as
     /// `num/den` (e.g. `25/1`) like `str()` of PyAV 19's `AVRational`, unlike
     /// `fractions.Fraction`/[`Rational`]'s Display.
@@ -315,9 +371,6 @@ fn concat_decision(
     }
 
     let stream = playable[0];
-    let codec_name = stream.codec_name.as_deref().unwrap_or("");
-    let profile = named_profile(stream).unwrap_or("").to_lowercase();
-    let is_av1 = codec_name == "av1";
     let frame_rate = stream.effective_rate();
     let (width, height) = (stream.width.unwrap_or(0), stream.height.unwrap_or(0));
     let mut reasons = codec_reasons(stream);
@@ -346,20 +399,30 @@ fn concat_decision(
     let (Some(frame_rate), Some(time_base)) = (frame_rate, time_base) else {
         unreachable!("checked above");
     };
+    let Some((codec, profile, probe_profile, pix_fmt)) = stream_concat_format(stream) else {
+        unreachable!("codec_reasons rejects other formats");
+    };
+    // Anything beyond the original 8-bit SDR H.264/AV1 path reproduces the
+    // source's colour description exactly.
+    let extended = codec == ConcatCodec::Hevc || pix_fmt != PIX_FMT_8 || stream.is_hdr();
     (
         Some(ConcatParams {
-            codec: if is_av1 {
-                ConcatCodec::Av1
-            } else {
-                ConcatCodec::H264
-            },
+            codec,
             width,
             height,
-            profile: if is_av1 {
-                "main"
-            } else {
-                h264_profile(&profile).unwrap_or("high")
-            },
+            profile,
+            probe_profile,
+            pix_fmt,
+            color: extended.then(|| TargetColor::of(stream)),
+            codec_tag: (codec == ConcatCodec::Hevc).then(|| {
+                stream
+                    .codec_tag_string
+                    .clone()
+                    .filter(|t| t == "hev1")
+                    .unwrap_or_else(|| "hvc1".to_owned())
+            }),
+            source_track_id: stream.track_id(),
+            hdr: None,
             frame_rate: format!("{}/{}", frame_rate.num, frame_rate.den),
             frame_duration: 1.0 / frame_rate.to_f64(),
             video_track_timescale: time_base.den,
@@ -375,34 +438,88 @@ fn codec_reasons(stream: &Stream) -> Vec<String> {
     let codec_name = stream.codec_name.as_deref().unwrap_or("");
     let raw_profile = named_profile(stream);
     let profile = raw_profile.unwrap_or("").to_lowercase();
-    let is_av1 = codec_name == "av1";
     let mut reasons: Vec<String> = Vec::new();
-    if codec_name != "h264" && !is_av1 {
+    if let Some(dv_profile) = stream.dolby_vision() {
+        let profile = dv_profile.map_or_else(String::new, |p| format!(" (profile {p})"));
+        let base = if dv_profile == Some(5) {
+            "; profile 5 has no HDR10/SDR base layer, so colours may shift"
+        } else {
+            ""
+        };
+        reasons.push(format!(
+            "video is Dolby Vision{profile}, whose metadata an inserted frame cannot \
+             carry; it is re-encoded without Dolby Vision{base}"
+        ));
+    }
+    let supported_codec = matches!(codec_name, "h264" | "hevc" | "av1");
+    if !supported_codec {
         let long_name = decoder_long_name(codec_name)
             .or_else(|| stream.codec_long_name.clone().filter(|s| !s.is_empty()))
             .unwrap_or_else(|| codec_name.to_owned());
         reasons.push(format!(
-            "video codec is {long_name} (fast copy supports H.264 and AV1 only)"
+            "video codec is {long_name} (fast copy supports H.264, HEVC and AV1 only)"
         ));
     }
-    if (is_av1 && profile != "main") || (!is_av1 && h264_profile(&profile).is_none()) {
+    let profile_ok = match codec_name {
+        "hevc" => matches!(profile.as_str(), "main" | "main 10"),
+        "av1" => profile == "main",
+        // Other codecs are judged by the H.264 list, as before.
+        _ => h264_profile(&profile).is_some() || profile == "high 10",
+    };
+    if !profile_ok {
         reasons.push(format!(
             "profile is {}",
             py_repr_str(raw_profile.unwrap_or("(none)"))
         ));
     }
     let pix_fmt = named_pix_fmt(stream);
-    if pix_fmt != Some("yuv420p") {
+    let shown = pix_fmt.map_or_else(|| "None".to_owned(), py_repr_str);
+    match pix_fmt {
+        Some(PIX_FMT_8 | PIX_FMT_10) => {
+            if supported_codec
+                && profile_ok
+                && concat_format(codec_name, &profile, pix_fmt.unwrap_or("")).is_none()
+            {
+                reasons.push(format!(
+                    "pixel format {shown} does not match profile {}",
+                    py_repr_str(raw_profile.unwrap_or("(none)"))
+                ));
+            }
+        }
+        _ if stream.bit_depth().unwrap_or(8) > 8 => reasons.push(format!(
+            "pixel format is {shown}, not yuv420p or yuv420p10le"
+        )),
+        _ => reasons.push(format!("pixel format is {shown}, not yuv420p")),
+    }
+    if stream.is_interlaced() {
         reasons.push(format!(
-            "pixel format is {}, not yuv420p",
-            pix_fmt.map_or_else(|| "None".to_owned(), py_repr_str)
+            "video is interlaced (field order {})",
+            py_repr_str(stream_field_order(stream))
         ));
+    }
+    if stream.is_hdr() && (stream.color_primaries().is_none() || stream.color_space().is_none()) {
+        reasons.push("HDR video without colour primaries or matrix information".to_owned());
     }
     let (width, height) = (stream.width.unwrap_or(0), stream.height.unwrap_or(0));
     if width == 0 || height == 0 {
         reasons.push(format!("invalid dimensions {width}x{height}"));
     }
     reasons
+}
+
+fn stream_field_order(stream: &Stream) -> &str {
+    stream.field_order.as_deref().unwrap_or("unknown")
+}
+
+/// [`concat_format`] of an eligible stream.
+fn stream_concat_format(
+    stream: &Stream,
+) -> Option<(ConcatCodec, &'static str, &'static str, &'static str)> {
+    concat_format(
+        stream.codec_name.as_deref().unwrap_or(""),
+        &named_profile(stream).unwrap_or("").to_lowercase(),
+        named_pix_fmt(stream).unwrap_or(""),
+    )
 }
 
 /// Decide from a *source* probe (any container) whether converting it to MP4
@@ -758,12 +875,28 @@ fn embed_mp4_mov(
     stages.start("Inspecting video streams");
     let info = probe::probe(video_path)?;
     let replace_existing_preview = opts.replace_existing_preview;
-    let reencode = ReencodeParams::new(&info, video_path, opts.frame_step_ms)?;
+    let mut reencode = ReencodeParams::new(&info, video_path, opts.frame_step_ms)?;
+    // HDR10 static metadata, repeated in the encoded preview / re-encode.
+    let hdr = info
+        .first_playable_video()
+        .filter(|s| s.color_transfer() == Some("smpte2084"))
+        .and_then(|s| match probe::hdr_static_metadata(video_path, s) {
+            Ok(meta) => Some(meta).filter(|m| !m.is_empty()),
+            Err(err) => {
+                log::warn!(
+                    "could not read HDR metadata of '{}': {err}",
+                    video_path.display()
+                );
+                None
+            }
+        });
+    reencode.hdr = hdr;
     // QuickTime extensions keep the QuickTime container (brand `qt  `).
     let output_format = fast_path_format(&video_ext).unwrap_or("mp4");
     let concat_params = if fast_path_format(&video_ext).is_some() {
         concat_decision(&info, video_path, replace_existing_preview)
             .0
+            .map(|params| ConcatParams { hdr, ..params })
             .filter(|_| {
                 // Stripping the old preview by stream copy needs the next
                 // packet to be a keyframe; otherwise re-encode (and trim).
@@ -867,6 +1000,23 @@ struct ReencodeParams {
     /// Effective frame rate as `num/den`; the preview lasts one such frame.
     frame_rate: String,
     frame_duration: f64,
+    encoder: ReencodeEncoder,
+    /// Colour description of the output (`None` for 8-bit SDR sources).
+    color: Option<TargetColor>,
+    hdr: Option<HdrStaticMetadata>,
+}
+
+/// Video encoder of the full re-encode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReencodeEncoder {
+    /// 8-bit SDR sources: libx264 High, yuv420p (the original behaviour).
+    X264,
+    /// High-bit-depth H.264 sources: libx264 High 10, yuv420p10le.
+    X264High10,
+    /// HDR or high-bit-depth sources of any other codec (including Dolby
+    /// Vision, 4:2:2/4:4:4 and 12-bit): libx265 Main 10 `hvc1`, yuv420p10le
+    /// — HEVC is what devices play HDR in, and Main 10 keeps PQ/HLG intact.
+    X265Main10,
 }
 
 impl ReencodeParams {
@@ -881,6 +1031,14 @@ impl ReencodeParams {
         let sar = stream
             .sample_aspect_ratio()
             .unwrap_or(Rational { num: 1, den: 1 });
+        let deep = stream.bit_depth().unwrap_or(8) > 8;
+        let encoder = if !deep && !stream.is_hdr() {
+            ReencodeEncoder::X264
+        } else if deep && stream.codec_name.as_deref() == Some("h264") {
+            ReencodeEncoder::X264High10
+        } else {
+            ReencodeEncoder::X265Main10
+        };
         Ok(Self {
             index: stream.index,
             width: stream.width.unwrap_or(0),
@@ -888,7 +1046,62 @@ impl ReencodeParams {
             sar: format!("{}/{}", sar.num, sar.den),
             frame_rate: format!("{}/{}", rate.num, rate.den),
             frame_duration: 1.0 / rate.to_f64(),
+            encoder,
+            color: (encoder != ReencodeEncoder::X264).then(|| TargetColor::of(stream)),
+            hdr: None,
         })
+    }
+
+    /// `-c:v:0 …` options of the main video stream (after `-map_chapters`).
+    fn video_encoder_args(&self) -> Vec<OsString> {
+        let pix_fmt = match self.encoder {
+            ReencodeEncoder::X264 => PIX_FMT_8,
+            _ => PIX_FMT_10,
+        };
+        let mut args = match self.encoder {
+            ReencodeEncoder::X264 | ReencodeEncoder::X264High10 => args!["-c:v:0", "libx264"],
+            ReencodeEncoder::X265Main10 => args!["-c:v:0", "libx265"],
+        };
+        args.extend(args![
+            "-preset:v:0",
+            "veryfast",
+            "-crf:v:0",
+            "23",
+            "-pix_fmt:v:0",
+            pix_fmt
+        ]);
+        let hdr_params = match self.encoder {
+            ReencodeEncoder::X264 => return args,
+            ReencodeEncoder::X264High10 => {
+                args.extend(args!["-profile:v:0", "high10"]);
+                hdr_encoder_params(ConcatCodec::H264, self.hdr.as_ref())
+            }
+            ReencodeEncoder::X265Main10 => {
+                args.extend(args![
+                    "-profile:v:0",
+                    "main10",
+                    "-tag:v:0",
+                    "hvc1",
+                    "-forced-idr:v:0",
+                    "1"
+                ]);
+                hdr_encoder_params(ConcatCodec::Hevc, self.hdr.as_ref())
+            }
+        };
+        if let Some(mut hdr) = hdr_params {
+            // `-x26?-params` → `-x26?-params:v:0`
+            hdr[0].push(":v:0");
+            args.extend(hdr);
+        }
+        if let Some(color) = &self.color {
+            args.extend(
+                color
+                    .encoder_args_for(":v:0")
+                    .into_iter()
+                    .map(OsString::from),
+            );
+        }
+        args
     }
 }
 
@@ -913,15 +1126,26 @@ fn reencode_args(
         sar,
         frame_rate,
         frame_duration,
+        ..
     } = params;
     let trim = if replace_existing_preview {
         "trim=start_frame=1,"
     } else {
         ""
     };
+    let (poster, base_format) = match params.encoder {
+        ReencodeEncoder::X264 => (
+            format!("scale={width}:{height}:flags=lanczos"),
+            String::new(),
+        ),
+        _ => (
+            color::preview_filter(*width, *height, PIX_FMT_10, params.color.as_ref()),
+            format!(",format={PIX_FMT_10}"),
+        ),
+    };
     let graph = format!(
-        "[1:v]scale={width}:{height}:flags=lanczos,setsar={sar},trim=end_frame=1[poster];\
-         [0:{index}]{trim}setpts=PTS-STARTPTS,setsar={sar}[base];\
+        "[1:v]{poster},setsar={sar},trim=end_frame=1[poster];\
+         [0:{index}]{trim}setpts=PTS-STARTPTS,setsar={sar}{base_format}[base];\
          [poster][base]concat=n=2:v=1:a=0[v]"
     );
     let mut args = args![
@@ -963,14 +1187,9 @@ fn reencode_args(
         "0",
         "-map_chapters",
         "0",
-        "-c:v:0",
-        "libx264",
-        "-preset:v:0",
-        "veryfast",
-        "-crf:v:0",
-        "23",
-        "-pix_fmt:v:0",
-        "yuv420p",
+    ]);
+    args.extend(params.video_encoder_args());
+    args.extend(args![
         // The first source frame starts a new GOP, so a later save can strip
         // the preview by stream copy (concat fast path replace).
         "-force_key_frames:v:0",
@@ -1012,29 +1231,49 @@ fn preview_matches(preview: &ProbeInfo, params: &ConcatParams) -> (bool, String)
     {
         profile = mapped.to_owned();
     }
+    let expected_profile = match params.codec {
+        // The original path compares mapped H.264 names (`constrained
+        // baseline` → `baseline`) with the encoder profile.
+        ConcatCodec::H264 if params.pix_fmt == PIX_FMT_8 => params.profile,
+        _ => params.probe_profile,
+    };
     let time_base = stream.time_base();
     let codec_ok = match params.codec {
         ConcatCodec::Av1 => codec_name == "av1",
         ConcatCodec::H264 => codec_name == "h264",
+        ConcatCodec::Hevc => codec_name == "hevc",
     };
+    let color_ok = params.color.as_ref().is_none_or(|c| c.matches(stream));
+    let tag_ok = params
+        .codec_tag
+        .as_deref()
+        .is_none_or(|t| stream.codec_tag_string.as_deref() == Some(t));
     let ok = codec_ok
-        && profile == params.profile
-        && named_pix_fmt(stream) == Some("yuv420p")
+        && profile == expected_profile
+        && named_pix_fmt(stream) == Some(params.pix_fmt)
         && stream.width == Some(params.width)
         && stream.height == Some(params.height)
-        && time_base.is_some_and(|tb| tb.num == 1 && tb.den == params.video_track_timescale);
+        && time_base.is_some_and(|tb| tb.num == 1 && tb.den == params.video_track_timescale)
+        && color_ok
+        && tag_ok;
     let detail = format!(
-        "codec={codec_name}, profile={:?}, pix_fmt={:?}, size={}x{}, time_base={}; \
-         expected profile={}, size={}x{}, time_base=1/{}",
+        "codec={codec_name}, profile={:?}, pix_fmt={:?}, size={}x{}, time_base={}, \
+         tag={:?}, color={:?}; expected profile={}, pix_fmt={}, size={}x{}, time_base=1/{}, \
+         tag={:?}, color={:?}",
         named_profile(stream),
         named_pix_fmt(stream),
         stream.width.unwrap_or(0),
         stream.height.unwrap_or(0),
         py_repr_rational(time_base),
-        params.profile,
+        stream.codec_tag_string,
+        TargetColor::of(stream),
+        expected_profile,
+        params.pix_fmt,
         params.width,
         params.height,
-        params.video_track_timescale
+        params.video_track_timescale,
+        params.codec_tag,
+        params.color,
     );
     (ok, detail)
 }
@@ -1248,7 +1487,27 @@ fn write_concat(
     replace_existing_preview: bool,
 ) -> Result<bool> {
     let duration_text = format_g(params.frame_duration, 12);
-    let encoder_args: Vec<OsString> = match params.codec {
+    // HEVC: the source's own sample entry (parameter sets, colour boxes) is
+    // put back after the concat run; see `sample_entries`.
+    let source_entry = if params.codec == ConcatCodec::Hevc {
+        let entry = params
+            .source_track_id
+            .ok_or_else(|| Error::Other("the source video has no track ID".to_owned()))
+            .and_then(|id| sample_entries::first_sample_entry(video_path, id));
+        match entry {
+            Ok(entry) => Some(entry),
+            Err(err) => {
+                debug!(
+                    "concat fast path skipped for '{}': cannot read the HEVC sample entry ({err})",
+                    video_path.display()
+                );
+                return Ok(false);
+            }
+        }
+    } else {
+        None
+    };
+    let mut encoder_args: Vec<OsString> = match params.codec {
         ConcatCodec::Av1 => args![
             "-c:v",
             "libaom-av1",
@@ -1265,7 +1524,7 @@ fn write_concat(
             "-b:v",
             "0",
             "-pix_fmt",
-            "yuv420p",
+            params.pix_fmt,
         ],
         ConcatCodec::H264 => args![
             "-c:v",
@@ -1273,9 +1532,25 @@ fn write_concat(
             "-profile:v",
             params.profile,
             "-pix_fmt",
-            "yuv420p"
+            params.pix_fmt
+        ],
+        ConcatCodec::Hevc => args![
+            "-c:v",
+            "libx265",
+            "-profile:v",
+            params.profile,
+            "-pix_fmt",
+            params.pix_fmt,
+            "-tag:v",
+            params.codec_tag.as_deref().unwrap_or("hvc1"),
         ],
     };
+    if let Some(color) = &params.color {
+        encoder_args.extend(color.encoder_args().into_iter().map(OsString::from));
+    }
+    if let Some(extra) = hdr_encoder_params(params.codec, params.hdr.as_ref()) {
+        encoder_args.extend(extra);
+    }
 
     stages.start("Encoding preview frame");
     let mut preview_args = args![
@@ -1289,7 +1564,12 @@ fn write_concat(
         "-frames:v",
         "1",
         "-vf",
-        format!("scale={}:{}:flags=lanczos", params.width, params.height),
+        color::preview_filter(
+            params.width,
+            params.height,
+            params.pix_fmt,
+            params.color.as_ref()
+        ),
         "-an",
         "-sn",
     ];
@@ -1404,7 +1684,53 @@ fn write_concat(
         output_path,
     ]);
     run_ffmpeg(copy_args)?;
+
+    if let Some(entry) = source_entry {
+        stages.start("Restoring the video's codec configuration");
+        let restored = probe::probe(output_path).and_then(|out| {
+            let id = out
+                .streams
+                .first()
+                .and_then(Stream::track_id)
+                .ok_or_else(|| Error::Other("the output video has no track ID".to_owned()))?;
+            sample_entries::use_entry_after_first_sample(output_path, id, &entry)
+        });
+        if let Err(err) = restored {
+            debug!(
+                "concat fast path abandoned for '{}': cannot restore the HEVC sample entry ({err})",
+                video_path.display()
+            );
+            return Ok(false);
+        }
+    }
     Ok(true)
+}
+
+/// Encoder options repeating HDR10 static metadata in the preview frame's
+/// SEI (x265/x264). libx265 also gets its log level here.
+fn hdr_encoder_params(
+    codec: ConcatCodec,
+    hdr: Option<&HdrStaticMetadata>,
+) -> Option<Vec<OsString>> {
+    let master = hdr.and_then(HdrStaticMetadata::master_display);
+    let cll = hdr.and_then(HdrStaticMetadata::max_cll);
+    match codec {
+        ConcatCodec::Hevc => {
+            let mut params = vec!["log-level=error".to_owned()];
+            params.extend(master.map(|m| format!("master-display={m}")));
+            params.extend(cll.map(|c| format!("max-cll={c}")));
+            Some(args!["-x265-params", params.join(":")])
+        }
+        ConcatCodec::H264 if master.is_some() || cll.is_some() => {
+            let mut params = Vec::new();
+            params.extend(master.map(|m| format!("mastering-display={m}")));
+            params.extend(cll.map(|c| format!("cll={c}")));
+            Some(args!["-x264-params", params.join(":")])
+        }
+        // libaom has no ffmpeg option for HDR metadata OBUs; the source
+        // frames keep theirs.
+        _ => None,
+    }
 }
 
 /// Run `ffmpeg … out` into a `.vt_out_*{ext}` file and move it over `tmp`.
@@ -1594,7 +1920,7 @@ mod tests {
         let (_, reason) = concat_decision(&probe_json(vp9, ""), Path::new("x.mp4"), false);
         assert_eq!(
             reason.as_deref(),
-            Some("video codec is Google VP9 (fast copy supports H.264 and AV1 only).")
+            Some("video codec is Google VP9 (fast copy supports H.264, HEVC and AV1 only).")
         );
     }
 
@@ -1608,7 +1934,7 @@ mod tests {
         assert_eq!(
             reason.as_deref(),
             Some(
-                "video codec is MPEG-2 video (fast copy supports H.264 and AV1 only); \
+                "video codec is MPEG-2 video (fast copy supports H.264, HEVC and AV1 only); \
                  profile is '(none)'; pixel format is 'yuv422p', not yuv420p; \
                  invalid dimensions 0x240; unsupported video time base AVRational(2, 90001); \
                  invalid frame rate None."
@@ -1630,7 +1956,7 @@ mod tests {
         let reason = remux_ineligibility_reason(&probe_json(mpeg2, "")).unwrap();
         assert!(reason.starts_with("video codec is "), "{reason}");
         assert!(
-            reason.ends_with("(fast copy supports H.264 and AV1 only)."),
+            reason.ends_with("(fast copy supports H.264, HEVC and AV1 only)."),
             "{reason}"
         );
         let yuv444 = H264.replace("yuv420p", "yuv444p");
@@ -1664,6 +1990,125 @@ mod tests {
         assert_eq!(params.codec, ConcatCodec::Av1);
         assert_eq!(params.frame_rate, "30000/1001");
         assert_eq!(params.video_track_timescale, 90000);
+    }
+
+    const HEVC_PQ: &str = r#"{"index": 0, "id": "0x1", "codec_type": "video",
+        "codec_name": "hevc", "profile": "Main 10", "codec_tag_string": "hvc1",
+        "pix_fmt": "yuv420p10le", "width": 3840, "height": 2160, "time_base": "1/90000",
+        "avg_frame_rate": "30/1", "r_frame_rate": "30/1", "color_range": "tv",
+        "color_space": "bt2020nc", "color_transfer": "smpte2084", "color_primaries": "bt2020",
+        "chroma_location": "left", "field_order": "progressive",
+        "disposition": {"attached_pic": 0}}"#;
+
+    fn decide(stream: &str) -> (Option<ConcatParams>, Option<String>) {
+        concat_decision(&probe_json(stream, ""), Path::new("x.mp4"), false)
+    }
+
+    #[test]
+    fn hdr10_hevc_is_eligible_with_colour() {
+        let (params, reason) = decide(HEVC_PQ);
+        assert_eq!(reason, None);
+        let params = params.unwrap();
+        assert_eq!(params.codec, ConcatCodec::Hevc);
+        assert_eq!((params.profile, params.pix_fmt), ("main10", "yuv420p10le"));
+        assert_eq!(params.codec_tag.as_deref(), Some("hvc1"));
+        assert_eq!(params.source_track_id, Some(1));
+        let color = params.color.unwrap();
+        assert!(color.is_hdr());
+        assert_eq!(color.space.as_deref(), Some("bt2020nc"));
+        let hev1 = HEVC_PQ.replace("hvc1", "hev1");
+        assert_eq!(decide(&hev1).0.unwrap().codec_tag.as_deref(), Some("hev1"));
+    }
+
+    #[test]
+    fn eight_bit_sdr_keeps_the_original_path() {
+        let (params, _) = decide(H264);
+        let params = params.unwrap();
+        assert_eq!(params.color, None);
+        assert_eq!(params.codec_tag, None);
+        let high10 = H264
+            .replace("\"High\"", "\"High 10\"")
+            .replace("yuv420p", "yuv420p10le");
+        let params = decide(&high10).0.unwrap();
+        assert_eq!((params.profile, params.pix_fmt), ("high10", "yuv420p10le"));
+        assert!(params.color.is_some());
+    }
+
+    #[test]
+    fn ineligible_hdr_and_high_depth_formats() {
+        let reason = |s: &str| decide(s).1.unwrap();
+        assert_eq!(
+            reason(
+                &HEVC_PQ
+                    .replace("yuv420p10le", "yuv420p12le")
+                    .replace("Main 10", "Rext")
+            ),
+            "profile is 'Rext'; pixel format is 'yuv420p12le', not yuv420p or yuv420p10le."
+        );
+        assert_eq!(
+            reason(&HEVC_PQ.replace("yuv420p10le", "yuv422p10le")),
+            "pixel format is 'yuv422p10le', not yuv420p or yuv420p10le."
+        );
+        assert_eq!(
+            reason(&HEVC_PQ.replace("yuv420p10le", "yuv420p")),
+            "pixel format 'yuv420p' does not match profile 'Main 10'."
+        );
+        assert_eq!(
+            reason(&HEVC_PQ.replace("\"progressive\"", "\"tt\"")),
+            "video is interlaced (field order 'tt')."
+        );
+        assert_eq!(
+            reason(&HEVC_PQ.replace("\"bt2020nc\"", "\"unknown\"")),
+            "HDR video without colour primaries or matrix information."
+        );
+        let dv = HEVC_PQ.replace(
+            "\"field_order\"",
+            r#""side_data_list": [{"side_data_type": "DOVI configuration record",
+                "dv_version_major": 1, "dv_profile": 8, "dv_level": 6}], "field_order""#,
+        );
+        assert_eq!(
+            reason(&dv),
+            "video is Dolby Vision (profile 8), whose metadata an inserted frame cannot carry; \
+             it is re-encoded without Dolby Vision."
+        );
+        let dv5 = HEVC_PQ.replace("hvc1", "dvh1");
+        assert!(reason(&dv5).starts_with("video is Dolby Vision, whose"));
+    }
+
+    #[test]
+    fn reencode_encoder_follows_the_source() {
+        let encoder = |s: &str| {
+            ReencodeParams::new(&probe_json(s, ""), Path::new("x.mp4"), 40)
+                .unwrap()
+                .encoder
+        };
+        assert_eq!(encoder(H264), ReencodeEncoder::X264);
+        assert_eq!(
+            encoder(&H264.replace("yuv420p", "yuv422p10le")),
+            ReencodeEncoder::X264High10
+        );
+        assert_eq!(encoder(HEVC_PQ), ReencodeEncoder::X265Main10);
+        let mut params =
+            ReencodeParams::new(&probe_json(HEVC_PQ, ""), Path::new("x.mp4"), 40).unwrap();
+        params.hdr = Some(HdrStaticMetadata {
+            primaries: Some([[0.68, 0.32], [0.265, 0.69], [0.15, 0.06], [0.3127, 0.329]]),
+            luminance: Some((0.0001, 1000.0)),
+            light_level: Some((1000, 400)),
+        });
+        let args: Vec<String> = params
+            .video_encoder_args()
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args.join(" "),
+            "-c:v:0 libx265 -preset:v:0 veryfast -crf:v:0 23 -pix_fmt:v:0 yuv420p10le \
+             -profile:v:0 main10 -tag:v:0 hvc1 -forced-idr:v:0 1 -x265-params:v:0 \
+             log-level=error:master-display=G(13250,34500)B(7500,3000)R(34000,16000)\
+             WP(15635,16450)L(10000000,1):max-cll=1000,400 -color_primaries:v:0 bt2020 \
+             -color_trc:v:0 smpte2084 -colorspace:v:0 bt2020nc -color_range:v:0 tv \
+             -chroma_sample_location:v:0 left"
+        );
     }
 
     fn head(ts: &[(i64, i64)]) -> Vec<PacketTs> {

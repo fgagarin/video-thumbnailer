@@ -138,6 +138,58 @@ To use a different FFmpeg build, set `FRAMECOVER_FFMPEG` and
 Hardware H.264 encoders are tried only if advertised by that build; if a device
 cannot initialize, another available encoder is tried.
 
+### Command line
+
+The same `framecover` program works from a terminal when the first argument is a
+command. Without arguments, or with file paths (`framecover video.mp4`,
+`framecover video.mp4 cover.jpg`), it opens the window as usual.
+
+```sh
+# Save clip-thumbnail.mp4 with the frame at 1:30 (the original stays unchanged)
+framecover set clip.mp4 --at 1:30
+
+# Times: 90, 12.5, 1:30, 01:02:03.250, 1500ms, or a percentage such as 33%
+# (the default when neither --at nor --image is given)
+framecover set a.mp4 b.mov --at 10% --output-dir thumbnails
+
+# Use an image, cropped to fill the frame, and overwrite the original
+framecover set clip.mp4 --image poster.jpg --crop --in-place
+
+# Containers FrameCover cannot edit: convert to MP4 first (the MP4 is the output)
+framecover set recording.m2ts --convert --at 5
+framecover convert recording.m2ts recording.mp4
+
+# What is in a file, and would saving re-encode it?
+framecover info clip.mp4 --json
+
+# Save a frame as an image
+framecover extract clip.mp4 --at 50% -o frame.png
+```
+
+`set` follows the app's saving rules: by default it saves a copy named
+`<name>-thumbnail.<ext>` next to each video (or `-o PATH` for a single video,
+`--output-dir DIR` for several), and replaces an existing copy only with
+`--overwrite`, unless it is a verified earlier copy of the same unchanged video.
+`--in-place` overwrites the original, like **Overwrite original…**. Progress and
+a warning when the whole video must be re-encoded go to stderr (`--quiet` hides
+them); each saved file's path goes to stdout, or one JSON object per video with
+`--json` (`input`, `output`, `success`, `error`, `duration_shift_ms`,
+`reencoded`, ...). A batch continues after a failed file. The file manager's
+thumbnail cache is refreshed after each save. `framecover help <command>` lists
+every option.
+
+Exit codes: `0` all files succeeded, `1` at least one failed, `2` invalid
+command line.
+
+**Windows:** `framecover.exe` is a windowed program, so an interactive `cmd.exe`
+or PowerShell prompt does not wait for it: the output still appears in the
+terminal, but after the next prompt (press **Enter** for a clean prompt), and
+`%ERRORLEVEL%` / `$LASTEXITCODE` are not set. To wait for the result and get the
+exit code, use `start /wait framecover ...` in `cmd.exe`, or pipe the output in
+PowerShell (`framecover info clip.mp4 | Out-Host`). Batch files, redirected
+output (`> out.txt`) and programs that start `framecover.exe` and read its output
+(Python `subprocess`, Git Bash, CI runners) wait normally.
+
 ---
 
 ## Development

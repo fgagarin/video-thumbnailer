@@ -15,6 +15,12 @@ use crate::error::{Error, Result};
 pub const TAG_MEAN: &str = "com.apple.iTunes";
 pub const FRAME_NUMBER_NAME: &str = "video-thumbnailer-frame-number";
 pub const POSITION_MS_NAME: &str = "video-thumbnailer-position-ms";
+/// Marks a cover inserted by FrameCover and says where it came from
+/// ([`PREVIEW_FROM_FRAME`] or [`PREVIEW_FROM_IMAGE`]). Files saved before
+/// v0.3 only carry the position tags, which still identify a frame preview.
+pub const PREVIEW_SOURCE_NAME: &str = "video-thumbnailer-preview";
+pub const PREVIEW_FROM_FRAME: &str = "frame";
+pub const PREVIEW_FROM_IMAGE: &str = "image";
 
 fn ident(name: &'static str) -> DataIdent {
     DataIdent::freeform(TAG_MEAN, name)
@@ -64,15 +70,46 @@ pub fn write_thumbnail_source(path: &Path, frame_number: u64, position_ms: u64) 
         Data::Utf8(frame_number.to_string()),
     );
     tag.set_data(ident(POSITION_MS_NAME), Data::Utf8(position_ms.to_string()));
+    tag.set_data(
+        ident(PREVIEW_SOURCE_NAME),
+        Data::Utf8(PREVIEW_FROM_FRAME.to_owned()),
+    );
     tag.write_with_path(path, &WRITE_ITEMS).map_err(map_err)
 }
 
 /// Write JPEG cover art into the MP4 `covr` tag (data type 13), replacing any
 /// existing artwork. Telegram clients read this rather than `attached_pic`.
+///
+/// This is the cover of a preview FrameCover inserted, so it is marked with
+/// [`PREVIEW_SOURCE_NAME`] = [`PREVIEW_FROM_IMAGE`] and the position of an
+/// earlier frame preview is dropped; [`write_thumbnail_source`], called
+/// afterwards for a frame, records the position and marks it a frame. The
+/// marker lets a later save replace this preview instead of stacking another
+/// one even when there is no position to save.
 pub fn write_covr(path: &Path, jpeg: &[u8]) -> Result<()> {
     let mut tag = Tag::read_with_path(path, &READ_ITEMS).map_err(map_err)?;
     tag.set_artwork(Img::jpeg(jpeg.to_vec()));
+    tag.remove_data_of(&ident(FRAME_NUMBER_NAME));
+    tag.remove_data_of(&ident(POSITION_MS_NAME));
+    tag.set_data(
+        ident(PREVIEW_SOURCE_NAME),
+        Data::Utf8(PREVIEW_FROM_IMAGE.to_owned()),
+    );
     tag.write_with_path(path, &WRITE_ITEMS).map_err(map_err)
+}
+
+/// Where the inserted preview came from ([`PREVIEW_FROM_FRAME`] or
+/// [`PREVIEW_FROM_IMAGE`]); `None` when the marker is absent (no FrameCover
+/// preview, or one saved before v0.3) or the file cannot be read.
+pub fn read_preview_source(path: &Path) -> Option<String> {
+    let cfg = ReadConfig {
+        read_image_data: false,
+        ..READ_ITEMS
+    };
+    let tag = Tag::read_with_path(path, &cfg).ok()?;
+    let first = tag.data_of(&ident(PREVIEW_SOURCE_NAME)).next()?;
+    let text = std::str::from_utf8(data_bytes(first)).ok()?.trim();
+    (!text.is_empty()).then(|| text.to_owned())
 }
 
 fn data_bytes(data: &Data) -> &[u8] {

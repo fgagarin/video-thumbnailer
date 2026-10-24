@@ -3,7 +3,7 @@
 // filmstrip_widget.py, timeline_widget.py).
 
 import { Theme } from "theme.slint";
-import { OpenFolderIcon, SaveGlyph, Spinner, WarningIcon, ChevronDown } from "icons.slint";
+import { OpenFolderIcon, SaveGlyph, Spinner, WarningIcon, ChevronDown, PictureGlyph } from "icons.slint";
 
 export struct FilmTile {
     x: length,
@@ -67,6 +67,7 @@ component Panel inherits Rectangle {
             text: root.title;
             font-size: 12px;
             horizontal-alignment: center;
+            overflow: elide;
             color: Theme.text;
         }
         Rectangle {
@@ -88,6 +89,116 @@ component Placeholder inherits Text {
 component PanelImage inherits Image {
     image-fit: contain;
     image-rendering: smooth;
+}
+
+// Outlined secondary button of the editor rows (34px, like the Save button).
+component ToolButton inherits Rectangle {
+    in property <string> text;
+    in property <string> tooltip;
+    in property <string> accessible-text: root.text;
+    in property <bool> enabled: true;
+    in property <bool> show-icon;
+    callback clicked();
+
+    height: 34px;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: Theme.panel-border;
+    background: !root.enabled ? transparent
+        : touch.pressed ? #80808040
+        : touch.has-hover ? #80808026 : Theme.panel-background;
+    opacity: root.enabled ? 1 : 0.5;
+    accessible-role: button;
+    accessible-label: root.accessible-text;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if root.enabled { root.clicked(); } }
+
+    HorizontalLayout {
+        padding-left: root.text == "" ? 8px : 12px;
+        padding-right: root.text == "" ? 8px : 12px;
+        spacing: 6px;
+        if root.show-icon: VerticalLayout {
+            alignment: center;
+            PictureGlyph { width: 18px; height: 18px; }
+        }
+        if root.text != "": Text {
+            text: root.text;
+            font-size: 13px;
+            color: Theme.text;
+            vertical-alignment: center;
+        }
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+    if root.tooltip != "": Tooltip { text: @markdown("\{root.tooltip}"); }
+}
+
+component Segment inherits Rectangle {
+    in property <string> text;
+    in property <bool> selected;
+    in property <bool> enabled: true;
+    callback clicked();
+
+    border-radius: 4px;
+    background: root.selected ? Theme.primary
+        : root.enabled && touch.has-hover ? #80808026 : transparent;
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-checked: root.selected;
+    accessible-checkable: true;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if root.enabled { root.clicked(); } }
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        Text {
+            text: root.text;
+            font-size: 13px;
+            color: root.selected ? white : Theme.text;
+            vertical-alignment: center;
+            horizontal-alignment: center;
+        }
+    }
+    touch := TouchArea {
+        enabled: root.enabled && !root.selected;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// "Fit to frame | Crop to frame" switch shown while an image is the source.
+component FitSwitch inherits Rectangle {
+    in property <bool> crop;
+    in property <bool> enabled: true;
+    callback changed(bool);
+
+    height: 34px;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: Theme.panel-border;
+    background: Theme.panel-background;
+    opacity: root.enabled ? 1 : 0.5;
+    HorizontalLayout {
+        padding: 3px;
+        spacing: 2px;
+        Segment {
+            text: "Fit to frame";
+            selected: !root.crop;
+            enabled: root.enabled;
+            clicked => { root.changed(false); }
+            Tooltip { text: @markdown("Show the whole image, with bars where its shape differs from the video"); }
+        }
+        Segment {
+            text: "Crop to frame";
+            selected: root.crop;
+            enabled: root.enabled;
+            clicked => { root.changed(true); }
+            Tooltip { text: @markdown("Fill the whole frame, cutting off the image's edges"); }
+        }
+    }
 }
 
 export component SaveButton inherits Rectangle {
@@ -222,27 +333,67 @@ export component Preview inherits Rectangle {
     in property <string> save-tooltip;
     in property <bool> reencode-visible;
     in property <string> saved-label;
+    in property <bool> image-mode;
+    in property <bool> image-crop;
     callback save-copy();
     callback overwrite();
     callback show-reencode-reason();
+    callback open-image();
+    callback use-video-frame();
+    callback set-image-crop(bool);
 
     // Two equal columns, positioned manually so image sizes never feed back
     // into the window layout.
     property <length> column-width: (root.width - 2 * 4px - 8px) / 2;
     min-height: 220px;
     preferred-height: 220px;
-    Panel {
+    VerticalLayout {
         x: 4px;
         y: 4px;
         width: root.column-width;
         height: root.height - 8px;
-        title: root.frame-title;
-        if root.has-frame: PanelImage {
-            width: parent.width;
-            height: parent.height;
-            source: root.frame-image;
+        spacing: 8px;
+        Panel {
+            vertical-stretch: 1;
+            title: root.frame-title;
+            if root.has-frame: PanelImage {
+                width: parent.width;
+                height: parent.height;
+                source: root.frame-image;
+            }
+            if !root.has-frame: Placeholder { text: "No frame selected"; }
         }
-        if !root.has-frame: Placeholder { text: "No frame selected"; }
+        // Thumbnail source: a video frame, or an image file fitted or
+        // cropped to the frame.
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: start;
+            if !root.image-mode: ToolButton {
+                text: "Use image…";
+                show-icon: true;
+                enabled: !root.saving;
+                tooltip: "Use a picture file as the thumbnail (Ctrl+I). You can also drop a picture onto the window.";
+                clicked => { root.open-image(); }
+            }
+            if root.image-mode: FitSwitch {
+                crop: root.image-crop;
+                enabled: !root.saving;
+                changed(crop) => { root.set-image-crop(crop); }
+            }
+            if root.image-mode: ToolButton {
+                text: "Use video frame";
+                enabled: !root.saving;
+                tooltip: "Go back to using a frame of the video. Clicking the timeline or the filmstrip does the same.";
+                clicked => { root.use-video-frame(); }
+            }
+            if root.image-mode: ToolButton {
+                show-icon: true;
+                accessible-text: "Choose another image";
+                enabled: !root.saving;
+                tooltip: "Choose another image (Ctrl+I)";
+                clicked => { root.open-image(); }
+            }
+        }
     }
     VerticalLayout {
         x: 4px + root.column-width + 8px;

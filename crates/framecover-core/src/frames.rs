@@ -15,6 +15,7 @@ use std::process::Stdio;
 
 use image::RgbImage;
 
+use crate::color;
 use crate::error::{Error, Result};
 use crate::ffmpeg::{self, Tool};
 use crate::models::VideoFile;
@@ -91,6 +92,10 @@ fn decode(path: &Path, seek_us: u64, max_frames: Option<u32>) -> Result<Option<R
     cmd.arg("-i").arg(path).args(["-map", "0:V:0"]);
     if let Some(n) = max_frames {
         cmd.arg("-frames:v").arg(n.to_string());
+    }
+    // HDR sources are tone-mapped to SDR (the same chain as the frame stream).
+    if let Some(filter) = color::display_filter_for(path) {
+        cmd.args(["-vf", filter]);
     }
     cmd.args(["-c:v", "ppm", "-pix_fmt", "rgb24", "-f", "image2pipe", "-"])
         .stdout(Stdio::piped())

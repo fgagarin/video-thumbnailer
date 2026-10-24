@@ -8,7 +8,7 @@ description = "FrameCover core: video probing, frame extraction and thumbnail em
 
 [dependencies]
 hex = "0.4.3"
-image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp", "bmp"] }
 jpeg-encoder = "0.7.1"
 log = "0.4.34"
 md5 = "0.8.1"

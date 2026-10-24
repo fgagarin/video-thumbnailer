@@ -108,9 +108,128 @@ pub struct Stream {
     pub disposition: Disposition,
     #[serde(default)]
     pub tags: HashMap<String, String>,
+    /// Container stream ID (`0x1`: the MP4/MOV `track_ID`).
+    #[serde(default)]
+    pub id: Option<String>,
+    /// Sample entry / FourCC (`avc1`, `hvc1`, `hev1`, `dvh1`…).
+    #[serde(default)]
+    pub codec_tag_string: Option<String>,
+    /// `tv` / `pc` (or `unknown`).
+    #[serde(default)]
+    pub color_range: Option<String>,
+    /// Matrix coefficients (`bt709`, `bt2020nc`…).
+    #[serde(default)]
+    pub color_space: Option<String>,
+    /// Transfer characteristics (`bt709`, `smpte2084`, `arib-std-b67`…).
+    #[serde(default)]
+    pub color_transfer: Option<String>,
+    #[serde(default)]
+    pub color_primaries: Option<String>,
+    /// `left`, `topleft`, `center`…
+    #[serde(default)]
+    pub chroma_location: Option<String>,
+    /// `progressive`, `tt`, `bb`, `tb`, `bt` or `unknown`.
+    #[serde(default)]
+    pub field_order: Option<String>,
+    /// Stream-level side data (mastering display, content light level,
+    /// Dolby Vision configuration…), as ffprobe prints it.
+    #[serde(default)]
+    pub side_data_list: Vec<serde_json::Value>,
+}
+
+/// A colour property ffprobe reports, `None` when unknown/unspecified.
+fn known(value: &Option<String>) -> Option<&str> {
+    value
+        .as_deref()
+        .filter(|v| !v.is_empty() && !matches!(*v, "unknown" | "unspecified" | "reserved"))
 }
 
 impl Stream {
+    /// The container's numeric stream ID (MP4/MOV `track_ID`).
+    pub fn track_id(&self) -> Option<u32> {
+        let id = self.id.as_deref()?;
+        match id.strip_prefix("0x") {
+            Some(hex) => u32::from_str_radix(hex, 16).ok(),
+            None => id.parse().ok(),
+        }
+    }
+
+    /// Known colour range (`tv`/`pc`).
+    pub fn color_range(&self) -> Option<&str> {
+        known(&self.color_range)
+    }
+
+    /// Known matrix coefficients.
+    pub fn color_space(&self) -> Option<&str> {
+        known(&self.color_space)
+    }
+
+    /// Known transfer characteristics.
+    pub fn color_transfer(&self) -> Option<&str> {
+        known(&self.color_transfer)
+    }
+
+    /// Known colour primaries.
+    pub fn color_primaries(&self) -> Option<&str> {
+        known(&self.color_primaries)
+    }
+
+    /// Known chroma sample location.
+    pub fn chroma_location(&self) -> Option<&str> {
+        known(&self.chroma_location)
+    }
+
+    /// High dynamic range video: PQ (SMPTE ST 2084, HDR10) or HLG
+    /// (ARIB STD-B67) transfer characteristics.
+    pub fn is_hdr(&self) -> bool {
+        matches!(self.color_transfer(), Some("smpte2084" | "arib-std-b67"))
+    }
+
+    /// Bits per sample from the pixel format (`yuv420p10le` → 10, 8 for
+    /// formats without a depth suffix).
+    pub fn bit_depth(&self) -> Option<u32> {
+        let pix_fmt = known(&self.pix_fmt)?;
+        let base = pix_fmt
+            .strip_suffix("le")
+            .or_else(|| pix_fmt.strip_suffix("be"))
+            .unwrap_or(pix_fmt);
+        // `yuv420p10` / `gbrp12`: digits after the planar `p` are the depth;
+        // `yuv420p` (no suffix) and packed formats are 8-bit.
+        let head = base.trim_end_matches(|c: char| c.is_ascii_digit());
+        let digits = &base[head.len()..];
+        Some(match digits.parse::<u32>() {
+            Ok(depth) if head.ends_with('p') => depth,
+            _ => 8,
+        })
+    }
+
+    /// Interlaced (field-coded) video according to ffprobe's field order.
+    pub fn is_interlaced(&self) -> bool {
+        matches!(known(&self.field_order), Some("tt" | "bb" | "tb" | "bt"))
+    }
+
+    /// Dolby Vision: a DOVI configuration record in the stream side data or
+    /// a Dolby Vision sample entry (`dvh1`, `dvhe`, `dav1`, `dva1`, `dvav`).
+    /// Returns the profile when known (`Some(None)` for an unknown profile).
+    pub fn dolby_vision(&self) -> Option<Option<u64>> {
+        let record = self.side_data_list.iter().find(|d| {
+            d.get("side_data_type")
+                .and_then(|t| t.as_str())
+                .is_some_and(|t| t.contains("DOVI") || t.contains("Dolby Vision"))
+        });
+        if let Some(record) = record {
+            return Some(record.get("dv_profile").and_then(serde_json::Value::as_u64));
+        }
+        let tag = self.codec_tag_string.as_deref().unwrap_or("");
+        matches!(tag, "dvh1" | "dvhe" | "dav1" | "dva1" | "dvav").then_some(None)
+    }
+
+    /// Stream-level side data entry of `kind` (e.g. `Mastering display metadata`).
+    pub fn side_data(&self, kind: &str) -> Option<&serde_json::Value> {
+        self.side_data_list
+            .iter()
+            .find(|d| d.get("side_data_type").and_then(|t| t.as_str()) == Some(kind))
+    }
     pub fn is_video(&self) -> bool {
         self.codec_type == "video"
     }
@@ -266,6 +385,128 @@ pub fn probe(path: &Path) -> Result<ProbeInfo> {
 /// Parse ffprobe JSON output.
 pub fn parse(json: &[u8]) -> Result<ProbeInfo> {
     serde_json::from_slice(json).map_err(|e| Error::Other(format!("invalid ffprobe output: {e}")))
+}
+
+/// HDR10 static metadata (SMPTE ST 2086 mastering display colour volume and
+/// CTA-861.3 content light level).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct HdrStaticMetadata {
+    /// `[[x, y]; 4]` for red, green, blue and the white point (CIE 1931).
+    pub primaries: Option<[[f64; 2]; 4]>,
+    /// `(min, max)` mastering luminance in cd/m².
+    pub luminance: Option<(f64, f64)>,
+    /// `(MaxCLL, MaxFALL)` in cd/m².
+    pub light_level: Option<(u64, u64)>,
+}
+
+impl HdrStaticMetadata {
+    pub fn is_empty(&self) -> bool {
+        self.primaries.is_none() && self.luminance.is_none() && self.light_level.is_none()
+    }
+
+    /// Read from ffprobe side data entries (stream or frame level).
+    pub fn from_side_data<'a>(entries: impl IntoIterator<Item = &'a serde_json::Value>) -> Self {
+        let mut meta = Self::default();
+        for entry in entries {
+            match entry.get("side_data_type").and_then(|t| t.as_str()) {
+                Some("Mastering display metadata") => {
+                    let value = |key: &str| {
+                        entry
+                            .get(key)
+                            .and_then(|v| v.as_str())
+                            .and_then(Rational::parse)
+                            .map(Rational::to_f64)
+                    };
+                    let point = |x: &str, y: &str| Some([value(x)?, value(y)?]);
+                    meta.primaries = (|| {
+                        Some([
+                            point("red_x", "red_y")?,
+                            point("green_x", "green_y")?,
+                            point("blue_x", "blue_y")?,
+                            point("white_point_x", "white_point_y")?,
+                        ])
+                    })();
+                    meta.luminance = value("min_luminance").zip(value("max_luminance"));
+                }
+                Some("Content light level metadata") => {
+                    let value = |key: &str| entry.get(key).and_then(serde_json::Value::as_u64);
+                    meta.light_level = value("max_content").zip(value("max_average"));
+                }
+                _ => {}
+            }
+        }
+        meta
+    }
+
+    /// x265/x264 `master-display` value:
+    /// `G(x,y)B(x,y)R(x,y)WP(x,y)L(max,min)` in 0.00002 and 0.0001 cd/m² units.
+    pub fn master_display(&self) -> Option<String> {
+        let [r, g, b, wp] = self.primaries?;
+        let (min, max) = self.luminance?;
+        let c = |v: f64| (v * 50_000.0).round() as u64;
+        let l = |v: f64| (v * 10_000.0).round() as u64;
+        Some(format!(
+            "G({},{})B({},{})R({},{})WP({},{})L({},{})",
+            c(g[0]),
+            c(g[1]),
+            c(b[0]),
+            c(b[1]),
+            c(r[0]),
+            c(r[1]),
+            c(wp[0]),
+            c(wp[1]),
+            l(max),
+            l(min)
+        ))
+    }
+
+    /// x265 `max-cll` / x264 `cll` value: `MaxCLL,MaxFALL`.
+    pub fn max_cll(&self) -> Option<String> {
+        self.light_level.map(|(cll, fall)| format!("{cll},{fall}"))
+    }
+}
+
+/// HDR10 static metadata of video stream `index`: the stream-level side data
+/// (MP4 `mdcv`/`clli` boxes) when present, else the first decoded frame's
+/// (HEVC/H.264 SEI, AV1 metadata OBUs).
+pub fn hdr_static_metadata(path: &Path, stream: &Stream) -> Result<HdrStaticMetadata> {
+    let from_stream = HdrStaticMetadata::from_side_data(&stream.side_data_list);
+    if from_stream.primaries.is_some() && from_stream.light_level.is_some() {
+        return Ok(from_stream);
+    }
+    #[derive(Deserialize)]
+    struct Frame {
+        #[serde(default)]
+        side_data_list: Vec<serde_json::Value>,
+    }
+    #[derive(Deserialize)]
+    struct Frames {
+        #[serde(default)]
+        frames: Vec<Frame>,
+    }
+    let mut cmd = ffmpeg::command(Tool::Ffprobe)?;
+    cmd.args(["-v", "error", "-select_streams"])
+        .arg(stream.index.to_string())
+        .args([
+            "-read_intervals",
+            "%+#1",
+            "-show_frames",
+            "-of",
+            "json",
+            "-i",
+        ])
+        .arg(path);
+    let out = ffmpeg::run(&mut cmd)?;
+    let parsed: Frames = serde_json::from_slice(&out.stdout)
+        .map_err(|e| Error::Other(format!("invalid ffprobe frame output: {e}")))?;
+    let from_frame = HdrStaticMetadata::from_side_data(
+        parsed.frames.iter().take(1).flat_map(|f| &f.side_data_list),
+    );
+    Ok(HdrStaticMetadata {
+        primaries: from_stream.primaries.or(from_frame.primaries),
+        luminance: from_stream.luminance.or(from_frame.luminance),
+        light_level: from_stream.light_level.or(from_frame.light_level),
+    })
 }
 
 #[cfg(test)]

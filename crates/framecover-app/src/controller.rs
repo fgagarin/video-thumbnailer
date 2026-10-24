@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use framecover_core::imaging::{IMAGE_EXTENSIONS, ImageFit};
 use framecover_core::thumbnail_writer::ThumbnailWriter;
 use framecover_core::{ApplyError, ApplyResult, UpdateInfo, UpdateStatus, VideoFile};
 use image::RgbImage;
@@ -53,6 +54,11 @@ If you are unsure or have not tested the program on similar files, save a copy i
 
 pub const CONFLICT_TITLE: &str = "Copy already exists";
 
+pub const IMAGE_NEEDS_VIDEO_TITLE: &str = "Open a video first";
+pub const IMAGE_NEEDS_VIDEO_TEXT: &str = "A picture can become the thumbnail of a video \
+that is open in FrameCover.\n\n\
+Open the video first, then drop the picture onto the window or use the Use image… button.";
+
 /// `true` on macOS, where the primary shortcut modifier is Command.
 const MAC: bool = cfg!(target_os = "macos");
 
@@ -62,6 +68,7 @@ pub fn shortcuts_text() -> String {
     format!(
         "{m}+O  Open video\n\
 {m}+S  Save preview as thumbnail\n\
+{m}+I  Use an image file as the thumbnail\n\
 Left / Right  Previous / next frame\n\
 Shift+/  Show keyboard shortcuts"
     )
@@ -70,6 +77,13 @@ Shift+/  Show keyboard shortcuts"
 // ---------------------------------------------------------------------------
 // Pure helpers
 // ---------------------------------------------------------------------------
+
+/// Whether `path` has one of the still-image extensions FrameCover reads.
+pub fn is_image_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| IMAGE_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
+}
 
 /// `<stem>-thumbnail<.ext>` next to `source`.
 pub fn default_copy_path(source: &Path) -> PathBuf {
@@ -337,6 +351,33 @@ Overwrite it or add another suffix to save a separate copy?",
     }
 }
 
+/// A still image used as the thumbnail instead of a video frame ("image
+/// mode"), already composed into the video's frame size both ways.
+#[derive(Debug, Clone)]
+pub struct CoverImage {
+    pub path: PathBuf,
+    pub fit: Arc<RgbImage>,
+    pub crop: Arc<RgbImage>,
+    pub mode: ImageFit,
+}
+
+impl CoverImage {
+    /// The image as it will be saved, for the current fit mode.
+    pub fn composed(&self) -> &Arc<RgbImage> {
+        match self.mode {
+            ImageFit::Fit => &self.fit,
+            ImageFit::Crop => &self.crop,
+        }
+    }
+
+    pub fn name(&self) -> String {
+        self.path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+}
+
 /// Everything the window shows, as plain data.
 #[derive(Debug)]
 pub struct State {
@@ -349,6 +390,14 @@ pub struct State {
     pub candidate: Option<(Arc<RgbImage>, u64)>,
     /// Image shown in the "Thumbnail" panel.
     pub thumbnail: Option<Arc<RgbImage>>,
+    /// Set while an image file, not a video frame, is the thumbnail source.
+    pub cover: Option<CoverImage>,
+    /// Fit mode for the next image (the last one chosen this session).
+    pub image_fit: ImageFit,
+    /// Folder of the last image opened this session.
+    pub image_directory: Option<PathBuf>,
+    /// An image to use once the video being loaded is open.
+    pub pending_image: Option<PathBuf>,
     pub reencode_reason: Option<String>,
     pub timeline: Timeline,
     pub saving: bool,
@@ -380,7 +429,27 @@ impl State {
     }
 
     pub fn save_enabled(&self) -> bool {
-        !self.busy && !self.saving && self.current_frame.is_some()
+        !self.busy && !self.saving && self.selected_thumbnail().is_some()
+    }
+
+    /// The thumbnail a save would write and the position to record with it:
+    /// the composed image (no position) in image mode, else the frame.
+    pub fn selected_thumbnail(&self) -> Option<(Arc<RgbImage>, Option<u64>)> {
+        match &self.cover {
+            Some(cover) => Some((Arc::clone(cover.composed()), None)),
+            None => self
+                .current_frame
+                .as_ref()
+                .map(|frame| (Arc::clone(frame), self.current_frame_position_ms)),
+        }
+    }
+
+    /// Image shown in the "Frame" panel.
+    pub fn panel_image(&self) -> Option<&Arc<RgbImage>> {
+        match &self.cover {
+            Some(cover) => Some(cover.composed()),
+            None => self.candidate.as_ref().map(|c| &c.0),
+        }
     }
 
     pub fn save_button_text(&self) -> &'static str {
@@ -403,6 +472,9 @@ impl State {
     }
 
     pub fn frame_title(&self) -> String {
+        if let Some(cover) = &self.cover {
+            return format!("Image ({})", cover.name());
+        }
         match &self.candidate {
             Some((_, ms)) => format!("Frame ({})", format_position(*ms)),
             None => "Frame".to_owned(),
@@ -450,6 +522,23 @@ pub enum Event {
     },
     StepFrame(i32),
     FilmstripSelected(u64),
+    /// "Use image…" button or Ctrl+I.
+    OpenImageRequested,
+    /// An image file to use as the thumbnail (from its file dialog).
+    OpenImage(PathBuf),
+    ImageLoaded {
+        token: u64,
+        path: PathBuf,
+        fit: RgbImage,
+        crop: RgbImage,
+    },
+    ImageLoadFailed {
+        token: u64,
+        details: String,
+    },
+    SetImageFit(ImageFit),
+    /// "Use video frame": leave image mode.
+    UseVideoFrame,
     FrameExtracted {
         generation: u64,
         image: RgbImage,
@@ -500,6 +589,16 @@ pub enum Effect {
     PickVideoFile {
         start_dir: PathBuf,
     },
+    PickImageFile {
+        start_dir: PathBuf,
+    },
+    /// Read an image file and compose it into a `width`x`height` frame.
+    LoadImage {
+        path: PathBuf,
+        width: u32,
+        height: u32,
+        token: u64,
+    },
     LoadVideo {
         path: PathBuf,
         token: u64,
@@ -533,6 +632,7 @@ pub struct Controller {
     has_update_checker: bool,
     rng: StdRng,
     load_token: u64,
+    image_token: u64,
     fx: Vec<Effect>,
 }
 
@@ -551,6 +651,10 @@ impl Controller {
                 current_frame_position_ms: None,
                 candidate: None,
                 thumbnail: None,
+                cover: None,
+                image_fit: ImageFit::default(),
+                image_directory: None,
+                pending_image: None,
                 reencode_reason: None,
                 timeline: Timeline::default(),
                 saving: false,
@@ -573,6 +677,7 @@ impl Controller {
             has_update_checker,
             rng,
             load_token: 0,
+            image_token: 0,
             fx: Vec::new(),
         }
     }
@@ -588,6 +693,28 @@ impl Controller {
             Event::TimelinePointer { ratio, released } => self.on_timeline_pointer(ratio, released),
             Event::StepFrame(direction) => self.step_selected_frame(direction),
             Event::FilmstripSelected(ms) => self.on_filmstrip_position_selected(ms),
+            Event::OpenImageRequested => self.open_image_dialog(),
+            Event::OpenImage(path) => self.open_image(path),
+            Event::ImageLoaded {
+                token,
+                path,
+                fit,
+                crop,
+            } => self.on_image_loaded(token, path, fit, crop),
+            Event::ImageLoadFailed { token, details } => self.on_image_error(token, &details),
+            Event::SetImageFit(mode) => {
+                if !self.state.saving {
+                    self.state.image_fit = mode;
+                    if let Some(cover) = &mut self.state.cover {
+                        cover.mode = mode;
+                    }
+                }
+            }
+            Event::UseVideoFrame => {
+                if !self.state.saving {
+                    self.state.cover = None;
+                }
+            }
             Event::FrameExtracted { generation, image } => {
                 self.on_frame_extracted(generation, image)
             }
@@ -754,6 +881,11 @@ longer and change its video codec.\n\nReason: {reason}"
         if self.state.converting || self.state.saving {
             return;
         }
+        // A dropped picture becomes the thumbnail of the open video.
+        if is_image_path(&path) {
+            self.open_image(path);
+            return;
+        }
         if let Some(directory) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             self.state.last_open_directory = directory.to_owned();
             self.fx
@@ -780,6 +912,8 @@ longer and change its video codec.\n\nReason: {reason}"
         let video = Arc::new(video);
         s.video = Some(Arc::clone(&video));
         s.video_generation += 1;
+        s.cover = None;
+        self.image_token += 1;
         s.copy_destination = None;
         s.current_frame = None;
         s.current_frame_position_ms = None;
@@ -799,6 +933,9 @@ longer and change its video codec.\n\nReason: {reason}"
         s.timeline.set_position(initial);
         s.busy = false;
         self.on_scrub(self.state.timeline.position_ms());
+        if let Some(image) = self.state.pending_image.take() {
+            self.open_image(image);
+        }
     }
 
     fn offer_conversion(&mut self, token: u64, path: PathBuf) {
@@ -807,6 +944,7 @@ longer and change its video codec.\n\nReason: {reason}"
         }
         self.state.busy = false;
         self.state.loading_path = None;
+        self.state.pending_image = None;
         self.state.dialogs.push(Dialog::ConvertOffer { path });
     }
 
@@ -820,10 +958,90 @@ longer and change its video codec.\n\nReason: {reason}"
         s.video_generation += 1;
         s.current_frame = None;
         s.candidate = None;
+        s.cover = None;
+        s.pending_image = None;
+        self.image_token += 1;
         s.busy = false;
         self.fx.push(Effect::SetFilmstripVideo(None));
         self.show_error(build_operation_error_report(
             Operation::Load,
+            details,
+            None,
+            None,
+        ));
+    }
+
+    // -- image as thumbnail -------------------------------------------------
+
+    fn explain_image_needs_video(&mut self) {
+        if self.state.dialogs.is_empty() {
+            self.state.dialogs.push(Dialog::Info {
+                title: IMAGE_NEEDS_VIDEO_TITLE.to_owned(),
+                text: IMAGE_NEEDS_VIDEO_TEXT.to_owned(),
+            });
+        }
+    }
+
+    fn open_image_dialog(&mut self) {
+        if self.state.saving || self.state.converting || self.modal_open() {
+            return;
+        }
+        let Some(video) = &self.state.video else {
+            self.explain_image_needs_video();
+            return;
+        };
+        let start_dir = self
+            .state
+            .image_directory
+            .clone()
+            .or_else(|| video.path.parent().map(Path::to_owned))
+            .unwrap_or_else(|| self.state.last_open_directory.clone());
+        self.fx.push(Effect::PickImageFile { start_dir });
+    }
+
+    fn open_image(&mut self, path: PathBuf) {
+        if self.state.converting || self.state.saving {
+            return;
+        }
+        if self.state.loading_path.is_some() {
+            // E.g. `framecover clip.mp4 cover.jpg`: use it once the video is open.
+            self.state.pending_image = Some(path);
+            return;
+        }
+        let Some(video) = &self.state.video else {
+            self.explain_image_needs_video();
+            return;
+        };
+        if let Some(directory) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            self.state.image_directory = Some(directory.to_owned());
+        }
+        self.image_token += 1;
+        self.fx.push(Effect::LoadImage {
+            path,
+            width: video.width,
+            height: video.height,
+            token: self.image_token,
+        });
+    }
+
+    fn on_image_loaded(&mut self, token: u64, path: PathBuf, fit: RgbImage, crop: RgbImage) {
+        if token != self.image_token || self.state.saving {
+            return;
+        }
+        self.state.cover = Some(CoverImage {
+            path,
+            fit: Arc::new(fit),
+            crop: Arc::new(crop),
+            mode: self.state.image_fit,
+        });
+    }
+
+    fn on_image_error(&mut self, token: u64, details: &str) {
+        if token != self.image_token {
+            return;
+        }
+        self.show_error(build_operation_error_report(
+            Operation::Image,
             details,
             None,
             None,
@@ -893,6 +1111,8 @@ longer and change its video codec.\n\nReason: {reason}"
         let Some(position) = self.state.timeline.position_for_ratio(ratio) else {
             return;
         };
+        // Choosing a point on the timeline goes back to using a frame.
+        self.state.cover = None;
         self.state.timeline.set_position(position);
         // Follow the pointer while dragging: requests coalesce in `on_scrub`,
         // so the frame updates as fast as frames can be decoded.
@@ -927,6 +1147,7 @@ longer and change its video codec.\n\nReason: {reason}"
         if s.saving || !s.dialogs.is_empty() {
             return;
         }
+        s.cover = None;
         // While a frame is being decoded, let a held key queue at most one
         // further step: the display then advances frame by frame and the
         // frame shown when the key is released is (almost) the one selected.
@@ -943,6 +1164,7 @@ longer and change its video codec.\n\nReason: {reason}"
         if self.state.saving {
             return;
         }
+        self.state.cover = None;
         self.state.timeline.set_position(offset_ms);
         self.on_scrub(self.state.timeline.position_ms());
     }
@@ -1003,7 +1225,9 @@ longer and change its video codec.\n\nReason: {reason}"
     // -- saving -------------------------------------------------------------
 
     fn can_start_save(&self) -> bool {
-        self.state.video.is_some() && self.state.current_frame.is_some() && !self.state.saving
+        self.state.video.is_some()
+            && self.state.selected_thumbnail().is_some()
+            && !self.state.saving
     }
 
     fn on_apply_clicked(&mut self) {
@@ -1048,7 +1272,8 @@ longer and change its video codec.\n\nReason: {reason}"
 
     fn start_apply(&mut self, destination: Option<PathBuf>, overwrite: bool) {
         let s = &mut self.state;
-        let (Some(video), Some(frame)) = (&s.video, &s.current_frame) else {
+        let (Some(video), Some((thumbnail, position_ms))) = (&s.video, s.selected_thumbnail())
+        else {
             return;
         };
         if s.saving || s.frame_extract_active {
@@ -1056,8 +1281,8 @@ longer and change its video codec.\n\nReason: {reason}"
         }
         let job = SaveJob {
             video: Arc::clone(video),
-            thumbnail: Arc::clone(frame),
-            position_ms: s.current_frame_position_ms,
+            thumbnail,
+            position_ms,
             destination,
             overwrite,
         };
@@ -1105,7 +1330,7 @@ longer and change its video codec.\n\nReason: {reason}"
         let note = result.error_message.as_deref().filter(|n| !n.is_empty());
         if let Some(output) = &result.output_path {
             // Keep editing the source so repeated saves do not prepend previews.
-            self.state.thumbnail = self.state.current_frame.clone();
+            self.state.thumbnail = self.state.selected_thumbnail().map(|(image, _)| image);
             self.state.save_tooltip = format!("Saved copy: {}", output.display());
             if let Some(note) = note {
                 self.state.save_tooltip.push('\n');
@@ -1114,20 +1339,29 @@ longer and change its video codec.\n\nReason: {reason}"
             return;
         }
         self.state.save_tooltip = note.unwrap_or(SAVE_TOOLTIP).to_owned();
-        let (Some(video), Some(frame)) =
-            (self.state.video.clone(), self.state.current_frame.clone())
+        let (Some(video), Some((thumbnail, saved_position))) =
+            (self.state.video.clone(), self.state.selected_thumbnail())
         else {
             return;
         };
         let shift = result.duration_shift_ms;
-        let (updated, position) =
-            apply_duration_shift(&video, &frame, self.state.current_frame_position_ms, shift);
+        let (mut updated, _) = apply_duration_shift(&video, &thumbnail, saved_position, shift);
+        if self.state.cover.is_some() {
+            // An image preview has no frame position (the writer dropped the
+            // old one); the marker tag identifies it as inserted.
+            updated.thumbnail_frame_number = None;
+        }
+        // The frame under the timeline moved with the rest of the video.
+        let position = self
+            .state
+            .current_frame_position_ms
+            .map(|p| (p + shift).min(updated.duration_ms));
         let updated = Arc::new(updated);
         let reason = self.reencode_reason(&updated);
         let s = &mut self.state;
         s.video = Some(Arc::clone(&updated));
         s.current_frame_position_ms = position;
-        s.thumbnail = Some(frame);
+        s.thumbnail = Some(thumbnail);
         s.reencode_reason = reason;
         if shift > 0 {
             s.timeline.set_duration(updated.duration_ms);
@@ -1910,6 +2144,317 @@ mod tests {
         );
     }
 
+    // -- image as thumbnail --------------------------------------------------
+
+    impl Harness {
+        fn image_requests(&self) -> Vec<(PathBuf, u32, u32, u64)> {
+            self.fx
+                .iter()
+                .filter_map(|e| match e {
+                    Effect::LoadImage {
+                        path,
+                        width,
+                        height,
+                        token,
+                    } => Some((path.clone(), *width, *height, *token)),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// Complete the pending image load with a 2x2 "fit" and a 3x3 "crop"
+        /// composition (told apart by size).
+        fn complete_image(&mut self) {
+            let [(path, ..)] = &self.image_requests()[..] else {
+                panic!("expected one image request: {:?}", self.fx);
+            };
+            let path = path.clone();
+            let token = self.c.image_token;
+            self.send(Event::ImageLoaded {
+                token,
+                path,
+                fit: RgbImage::new(2, 2),
+                crop: RgbImage::new(3, 3),
+            });
+        }
+
+        fn dropped_image(&mut self) {
+            self.send(Event::OpenPath("/pics/Cover Photo.JPG".into()));
+            self.complete_image();
+        }
+    }
+
+    #[test]
+    fn dropped_image_becomes_the_source_composed_to_the_video_size() {
+        let mut h = Harness::new();
+        selected(&mut h);
+        let dir_before = h.s().last_open_directory.clone();
+        h.send(Event::OpenPath("/pics/Cover Photo.JPG".into()));
+        assert_eq!(
+            h.image_requests(),
+            [(
+                PathBuf::from("/pics/Cover Photo.JPG"),
+                1920,
+                1080,
+                h.c.image_token
+            )]
+        );
+        assert!(
+            !h.fx.iter().any(|e| matches!(e, Effect::LoadVideo { .. })),
+            "an image is not opened as a video"
+        );
+        assert_eq!(h.s().last_open_directory, dir_before);
+        assert!(h.s().cover.is_none(), "frame mode until the image is read");
+        h.complete_image();
+        assert_eq!(h.s().frame_title(), "Image (Cover Photo.JPG)");
+        assert_eq!(h.s().panel_image().unwrap().dimensions(), (2, 2), "Fit");
+        assert!(h.s().save_enabled());
+    }
+
+    #[test]
+    fn image_button_opens_a_picker_then_loads_the_choice() {
+        let mut h = Harness::new();
+        selected(&mut h);
+        assert!(matches!(&h.send(Event::OpenImageRequested)[..],
+            [Effect::PickImageFile { start_dir }] if start_dir == Path::new("/fake")));
+        // Whatever the extension, a picked file is read as an image.
+        h.send(Event::OpenImage("/pics/cover.heic".into()));
+        assert_eq!(h.image_requests().len(), 1);
+        h.complete_image();
+        assert_eq!(h.s().frame_title(), "Image (cover.heic)");
+        // The picker then starts in the image's folder.
+        assert!(matches!(&h.send(Event::OpenImageRequested)[..],
+            [Effect::PickImageFile { start_dir }] if start_dir == Path::new("/pics")));
+    }
+
+    #[test]
+    fn image_without_video_explains_what_to_do() {
+        let mut h = Harness::new();
+        assert!(h.send(Event::OpenPath("/pics/a.png".into())).is_empty());
+        assert!(matches!(h.s().top_dialog(),
+            Some(Dialog::Info { title, .. }) if title == IMAGE_NEEDS_VIDEO_TITLE));
+        assert!(!h.s().busy);
+        h.send(Event::DialogDismissed);
+        assert!(h.send(Event::OpenImageRequested).is_empty());
+        assert!(matches!(h.s().top_dialog(), Some(Dialog::Info { .. })));
+    }
+
+    #[test]
+    fn image_given_while_a_video_loads_is_used_once_it_is_open() {
+        let mut h = Harness::new();
+        h.send(Event::OpenPath("/fake/video.mp4".into()));
+        assert!(h.send(Event::OpenPath("/pics/a.png".into())).is_empty());
+        assert!(h.s().dialogs.is_empty());
+        let token = h.c.load_token;
+        h.send(Event::VideoLoaded {
+            token,
+            video: Box::new(video(5000)),
+        });
+        assert_eq!(h.image_requests().len(), 1);
+        assert_eq!(h.extracts().len(), 1, "the frame is still decoded");
+        h.complete_image();
+        assert_eq!(h.s().frame_title(), "Image (a.png)");
+
+        // Dropped if the video can't be opened.
+        let mut h = Harness::new();
+        h.send(Event::OpenPath("/fake/broken.mp4".into()));
+        h.send(Event::OpenPath("/pics/a.png".into()));
+        let token = h.c.load_token;
+        h.send(Event::LoadFailed {
+            token,
+            details: "boom".into(),
+        });
+        assert_eq!(h.s().pending_image, None);
+    }
+
+    #[test]
+    fn dropped_video_still_opens_and_leaves_image_mode() {
+        let mut h = Harness::new();
+        selected(&mut h);
+        h.dropped_image();
+        h.send(Event::OpenPath("/fake/other.MOV".into()));
+        assert!(h.fx.iter().any(
+            |e| matches!(e, Effect::LoadVideo { path, .. } if path == Path::new("/fake/other.MOV"))
+        ));
+        h.load(VideoFile {
+            path: "/fake/other.MOV".into(),
+            ..video(5000)
+        });
+        assert!(h.s().cover.is_none());
+        assert!(h.s().frame_title().starts_with("Frame"));
+    }
+
+    #[test]
+    fn fit_and_crop_switch_the_composed_image() {
+        let mut h = Harness::new();
+        selected(&mut h);
+        h.dropped_image();
+        h.send(Event::SetImageFit(ImageFit::Crop));
+        assert_eq!(h.s().panel_image().unwrap().dimensions(), (3, 3));
+        h.send(Event::SaveCopyClicked);
+        assert_eq!(h.save_job().unwrap().thumbnail.dimensions(), (3, 3));
+        h.send(Event::SaveFinished(ApplyResult {
+            output_path: Some("/fake/video-thumbnail.mp4".into()),
+            ..ApplyResult::ok()
+        }));
+        assert_eq!(h.s().thumbnail.as_ref().unwrap().dimensions(), (3, 3));
+        h.send(Event::SetImageFit(ImageFit::Fit));
+        assert_eq!(h.s().panel_image().unwrap().dimensions(), (2, 2));
+        // The choice carries over to the next image.
+        h.send(Event::SetImageFit(ImageFit::Crop));
+        h.dropped_image();
+        assert_eq!(h.s().cover.as_ref().unwrap().mode, ImageFit::Crop);
+    }
+
+    #[test]
+    fn timeline_filmstrip_arrows_and_button_return_to_the_frame() {
+        let mut h = Harness::new();
+        selected(&mut h);
+        let frame_title = h.s().frame_title();
+        h.dropped_image();
+        h.send(Event::UseVideoFrame);
+        assert!(h.s().cover.is_none());
+        assert_eq!(h.s().frame_title(), frame_title);
+        assert_eq!(h.s().panel_image().unwrap().dimensions(), (32, 32));
+
+        h.dropped_image();
+        h.send(Event::TimelinePointer {
+            ratio: 0.5,
+            released: false,
+        });
+        assert!(h.s().cover.is_none());
+        assert_eq!(h.extracts(), [2500]);
+        h.complete_extract();
+
+        h.dropped_image();
+        h.send(Event::FilmstripSelected(4000));
+        assert!(h.s().cover.is_none());
+        h.complete_extract();
+
+        h.dropped_image();
+        h.send(Event::StepFrame(-1));
+        assert!(h.s().cover.is_none());
+        assert_eq!(h.extracts(), [3960]);
+    }
+
+    #[test]
+    fn image_save_carries_the_composed_image_without_a_position() {
+        let mut h = Harness::new();
+        selected(&mut h);
+        h.dropped_image();
+        h.send(Event::SaveCopyClicked);
+        let job = h.save_job().unwrap();
+        assert_eq!(job.thumbnail.dimensions(), (2, 2));
+        assert_eq!(job.position_ms, None);
+        // The source can't change while saving.
+        h.send(Event::UseVideoFrame);
+        h.send(Event::SetImageFit(ImageFit::Crop));
+        h.send(Event::OpenPath("/pics/b.png".into()));
+        assert!(h.image_requests().is_empty());
+        let cover = h.s().cover.as_ref().unwrap();
+        assert_eq!(cover.mode, ImageFit::Fit);
+    }
+
+    #[test]
+    fn in_place_image_save_shifts_the_timeline_and_stays_in_image_mode() {
+        let mut h = Harness::new();
+        h.load(VideoFile {
+            thumbnail_frame_number: Some(25),
+            thumbnail_position_ms: Some(1000),
+            ..video(5000)
+        });
+        h.complete_extract();
+        h.dropped_image();
+        h.c.state.skip_overwrite_warning = true;
+        h.send(Event::OverwriteClicked);
+        let job = h.save_job().unwrap();
+        assert_eq!((job.destination.clone(), job.position_ms), (None, None));
+        h.send(Event::SaveFinished(ApplyResult {
+            duration_shift_ms: 40,
+            ..ApplyResult::ok()
+        }));
+        let video = h.s().video.clone().unwrap();
+        assert_eq!(video.duration_ms, 5040);
+        assert_eq!(video.thumbnail_position_ms, None);
+        assert_eq!(video.thumbnail_frame_number, None);
+        assert_eq!(
+            video.existing_thumbnail.as_ref().unwrap().dimensions(),
+            (2, 2)
+        );
+        assert_eq!(h.s().timeline.duration_ms(), 5040);
+        assert_eq!(h.s().timeline.position_ms(), 1040);
+        assert_eq!(h.s().current_frame_position_ms, Some(1040));
+        assert_eq!(h.extracts(), [1040], "the frame under the timeline moved");
+        assert!(h.s().cover.is_some(), "still in image mode");
+        assert_eq!(h.s().panel_image().unwrap().dimensions(), (2, 2));
+        assert_eq!(h.s().thumbnail.as_ref().unwrap().dimensions(), (2, 2));
+        h.complete_extract();
+        assert!(h.s().cover.is_some());
+        assert!(h.s().save_enabled());
+    }
+
+    #[test]
+    fn unreadable_image_shows_error_and_keeps_the_mode() {
+        let mut h = Harness::new();
+        selected(&mut h);
+        h.send(Event::OpenPath("/pics/broken.png".into()));
+        let token = h.c.image_token;
+        h.send(Event::ImageLoadFailed {
+            token,
+            details: "Could not read the image".into(),
+        });
+        assert!(
+            matches!(h.s().top_dialog(), Some(Dialog::Error { report, .. })
+            if report.title == "Could not use this image"
+                && report.stack_trace == "Could not read the image")
+        );
+        assert!(h.s().cover.is_none());
+        assert!(h.s().frame_title().starts_with("Frame ("));
+
+        // In image mode a failure keeps the current image.
+        h.send(Event::DialogDismissed);
+        h.dropped_image();
+        h.send(Event::OpenPath("/pics/broken.png".into()));
+        let token = h.c.image_token;
+        h.send(Event::ImageLoadFailed {
+            token,
+            details: "x".into(),
+        });
+        assert_eq!(h.s().frame_title(), "Image (Cover Photo.JPG)");
+    }
+
+    #[test]
+    fn stale_image_results_are_ignored() {
+        let mut h = Harness::new();
+        selected(&mut h);
+        h.send(Event::OpenPath("/pics/a.png".into()));
+        let stale = h.c.image_token;
+        h.load(VideoFile {
+            path: "/fake/other.mp4".into(),
+            ..video(5000)
+        });
+        h.send(Event::ImageLoaded {
+            token: stale,
+            path: "/pics/a.png".into(),
+            fit: RgbImage::new(2, 2),
+            crop: RgbImage::new(3, 3),
+        });
+        assert!(h.s().cover.is_none());
+        h.send(Event::ImageLoadFailed {
+            token: stale,
+            details: "x".into(),
+        });
+        assert!(h.s().dialogs.is_empty());
+    }
+
+    #[test]
+    fn image_paths_are_recognised_by_extension() {
+        assert!(is_image_path(Path::new("/a/b.JPEG")));
+        assert!(is_image_path(Path::new("b.webp")));
+        assert!(!is_image_path(Path::new("b.mp4")));
+        assert!(!is_image_path(Path::new("png")));
+    }
+
     // -- conversion ----------------------------------------------------------
 
     fn unsupported(h: &mut Harness, path: &str) {
@@ -2118,7 +2663,7 @@ mod tests {
         match h.s().top_dialog() {
             Some(Dialog::Info { title, text }) => {
                 assert_eq!(title, "Keyboard shortcuts");
-                for needle in ["+O", "+S", "Left / Right", "Shift+/"] {
+                for needle in ["+O", "+S", "+I", "Left / Right", "Shift+/"] {
                     assert!(text.contains(needle));
                 }
             }
